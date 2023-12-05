@@ -55,7 +55,7 @@ message ListVolumesReply {
 }
 
 message RegisterObjectRequest {
-    bytes name = 1;
+    string name = 1;
     uint32 volume_index = 2;
     uint64 offset = 3;  // Object offset within volume
     uint64 next_offset = 4;  // Next offset to start from in the volume
@@ -65,48 +65,48 @@ message RegisterObjectRequest {
 message RegisterObjectReply {}
 
 message UnregisterObjectRequest {
-    bytes name = 1;
+    string name = 1;
     bool repair_tool = 2;
 }
 
 message UnregisterObjectReply {}
 
 message RenameObjectRequest {
-    bytes name = 1;
-    bytes new_name = 2;
+    string name = 1;
+    string new_name = 2;
     bool repair_tool = 3;
 }
 
 message RenameObjectReply {}
 
 message LoadObjectRequest {
-    bytes name = 1;
+    string name = 1;
     bool is_quarantined = 2;
     bool repair_tool = 3;
 }
 
 message LoadObjectReply {
-    bytes name = 1;
+    string name = 1;
     uint32 volume_index = 2;
     uint64 offset = 3;
 }
 
 message QuarantineObjectRequest {
-    bytes name = 1;
+    string name = 1;
     bool repair_tool = 2;
 }
 
 message QuarantineObjectReply {}
 
 message UnquarantineObjectRequest {
-    bytes name = 1;
+    string name = 1;
     bool repair_tool = 2;
 }
 
 message UnquarantineObjectReply {}
 
 message LoadObjectsByPrefixRequest {
-    bytes prefix = 1;
+    string prefix = 1;
     bool repair_tool = 2;
 }
 
@@ -117,14 +117,14 @@ message LoadObjectsByPrefixReply {
 message LoadObjectsByVolumeRequest {
     uint32 index = 1;
     bool quarantined = 2;  // List only quarantined files, if true
-    bytes page_token = 3;
+    string page_token = 3;
     uint32 page_size = 4;
     bool repair_tool = 5;
 }
 
 message LoadObjectsByVolumeReply {
     repeated Object objects = 1;
-    bytes next_page_token = 2;
+    string next_page_token = 2;
 }
 
 message ListPartitionsRequest {
@@ -138,22 +138,22 @@ message ListPartitionRequest {
 
 message ListSuffixRequest {
     uint32 partition = 1;
-    bytes suffix = 2;
+    string suffix = 2;
     uint32 partition_bits = 3;
 }
 
 message ListQuarantinedOHashesRequest {
-    bytes page_token = 1;
+    string page_token = 1;
     uint32 page_size = 2;
 }
 
 message ListQuarantinedOHashesReply {
     repeated QuarantinedObjectName objects = 1;
-    bytes next_page_token = 2;
+    string next_page_token = 2;
 }
 
 message ListQuarantinedOHashRequest {
-    bytes prefix = 1;
+    string prefix = 1;
     bool repair_tool = 2;
 }
 
@@ -194,13 +194,13 @@ message Volume {
 }
 
 message Object {
-    bytes name = 1;
+    string name = 1;
     uint32 volume_index = 2;
     uint64 offset = 3;
 }
 
 message QuarantinedObjectName {
-    bytes name = 1;
+    string name = 1;
 }
 
 // For listdir() like functions

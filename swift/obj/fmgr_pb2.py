@@ -20,7 +20,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=None,
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n\nfmgr.proto\x12\x07\x66ilemgr\"\xad\x01\n\x15RegisterVolumeRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12!\n\x04type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_index\x18\x03 \x01(\r\x12\x0e\n\x06offset\x18\x04 \x01(\x04\x12#\n\x05state\x18\x05 \x01(\x0e\x32\x14.filemgr.VolumeState\x12\x13\n\x0brepair_tool\x18\x06 \x01(\x08\"\x15\n\x13RegisterVolumeReply\"=\n\x17UnregisterVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15UnregisterVolumeReply\"j\n\x18UpdateVolumeStateRequest\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12#\n\x05state\x18\x02 \x01(\x0e\x32\x14.filemgr.VolumeState\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"\x18\n\x16UpdateVolumeStateReply\"6\n\x10GetVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x8e\x01\n\x0eGetVolumeReply\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12(\n\x0bvolume_type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_state\x18\x03 \x01(\r\x12\x11\n\tpartition\x18\x04 \x01(\r\x12\x13\n\x0bnext_offset\x18\x05 \x01(\x04\"_\n\x12ListVolumesRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12!\n\x04type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"4\n\x10ListVolumesReply\x12 \n\x07volumes\x18\x01 \x03(\x0b\x32\x0f.filemgr.Volume\"u\n\x15RegisterObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\x12\x13\n\x0bnext_offset\x18\x04 \x01(\x04\x12\x13\n\x0brepair_tool\x18\x05 \x01(\x08\"\x15\n\x13RegisterObjectReply\"<\n\x17UnregisterObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15UnregisterObjectReply\"J\n\x13RenameObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x10\n\x08new_name\x18\x02 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"\x13\n\x11RenameObjectReply\"N\n\x11LoadObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x16\n\x0eis_quarantined\x18\x02 \x01(\x08\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"E\n\x0fLoadObjectReply\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\"<\n\x17QuarantineObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15QuarantineObjectReply\">\n\x19UnquarantineObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x19\n\x17UnquarantineObjectReply\"A\n\x1aLoadObjectsByPrefixRequest\x12\x0e\n\x06prefix\x18\x01 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"<\n\x18LoadObjectsByPrefixReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\"|\n\x1aLoadObjectsByVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0bquarantined\x18\x02 \x01(\x08\x12\x12\n\npage_token\x18\x03 \x01(\x0c\x12\x11\n\tpage_size\x18\x04 \x01(\r\x12\x13\n\x0brepair_tool\x18\x05 \x01(\x08\"U\n\x18LoadObjectsByVolumeReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\x0c\"/\n\x15ListPartitionsRequest\x12\x16\n\x0epartition_bits\x18\x01 \x01(\r\"A\n\x14ListPartitionRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12\x16\n\x0epartition_bits\x18\x02 \x01(\r\"N\n\x11ListSuffixRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12\x0e\n\x06suffix\x18\x02 \x01(\x0c\x12\x16\n\x0epartition_bits\x18\x03 \x01(\r\"F\n\x1dListQuarantinedOHashesRequest\x12\x12\n\npage_token\x18\x01 \x01(\x0c\x12\x11\n\tpage_size\x18\x02 \x01(\r\"g\n\x1bListQuarantinedOHashesReply\x12/\n\x07objects\x18\x01 \x03(\x0b\x32\x1e.filemgr.QuarantinedObjectName\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\x0c\"B\n\x1bListQuarantinedOHashRequest\x12\x0e\n\x06prefix\x18\x01 \x01(\x0c\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"=\n\x19ListQuarantinedOHashReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\"A\n\x14GetNextOffsetRequest\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"$\n\x12GetNextOffsetReply\x12\x0e\n\x06offset\x18\x01 \x01(\x04\"\x11\n\x0fGetStatsRequest\"o\n\rGetStatsReply\x12\x30\n\x05stats\x18\x01 \x03(\x0b\x32!.filemgr.GetStatsReply.StatsEntry\x1a,\n\nStatsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\"\x11\n\x0fSetKvStateReply\"\x13\n\x11GetKvStateRequest\"\x1a\n\x07KvState\x12\x0f\n\x07isClean\x18\x01 \x01(\x08\"\x86\x01\n\x06Volume\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12(\n\x0bvolume_type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_state\x18\x03 \x01(\r\x12\x11\n\tpartition\x18\x04 \x01(\r\x12\x13\n\x0bnext_offset\x18\x05 \x01(\x04\"<\n\x06Object\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\"%\n\x15QuarantinedObjectName\x12\x0c\n\x04name\x18\x01 \x01(\x0c\"\x1b\n\nDirEntries\x12\r\n\x05\x65ntry\x18\x01 \x03(\t*N\n\nVolumeType\x12\x12\n\x0eVOLUME_DEFAULT\x10\x00\x12\x14\n\x10VOLUME_TOMBSTONE\x10\x01\x12\x16\n\x12VOLUME_X_DELETE_AT\x10\x02*R\n\x0bVolumeState\x12\x0c\n\x08STATE_RW\x10\x00\x12\x18\n\x14STATE_COMPACTION_SRC\x10\x01\x12\x1b\n\x17STATE_COMPACTION_TARGET\x10\x02\x62\x06proto3'
+  serialized_pb=b'\n\nfmgr.proto\x12\x07\x66ilemgr\"\xad\x01\n\x15RegisterVolumeRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12!\n\x04type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_index\x18\x03 \x01(\r\x12\x0e\n\x06offset\x18\x04 \x01(\x04\x12#\n\x05state\x18\x05 \x01(\x0e\x32\x14.filemgr.VolumeState\x12\x13\n\x0brepair_tool\x18\x06 \x01(\x08\"\x15\n\x13RegisterVolumeReply\"=\n\x17UnregisterVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15UnregisterVolumeReply\"j\n\x18UpdateVolumeStateRequest\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12#\n\x05state\x18\x02 \x01(\x0e\x32\x14.filemgr.VolumeState\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"\x18\n\x16UpdateVolumeStateReply\"6\n\x10GetVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x8e\x01\n\x0eGetVolumeReply\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12(\n\x0bvolume_type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_state\x18\x03 \x01(\r\x12\x11\n\tpartition\x18\x04 \x01(\r\x12\x13\n\x0bnext_offset\x18\x05 \x01(\x04\"_\n\x12ListVolumesRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12!\n\x04type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"4\n\x10ListVolumesReply\x12 \n\x07volumes\x18\x01 \x03(\x0b\x32\x0f.filemgr.Volume\"u\n\x15RegisterObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\x12\x13\n\x0bnext_offset\x18\x04 \x01(\x04\x12\x13\n\x0brepair_tool\x18\x05 \x01(\x08\"\x15\n\x13RegisterObjectReply\"<\n\x17UnregisterObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15UnregisterObjectReply\"J\n\x13RenameObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x10\n\x08new_name\x18\x02 \x01(\t\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"\x13\n\x11RenameObjectReply\"N\n\x11LoadObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x16\n\x0eis_quarantined\x18\x02 \x01(\x08\x12\x13\n\x0brepair_tool\x18\x03 \x01(\x08\"E\n\x0fLoadObjectReply\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\"<\n\x17QuarantineObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x17\n\x15QuarantineObjectReply\">\n\x19UnquarantineObjectRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"\x19\n\x17UnquarantineObjectReply\"A\n\x1aLoadObjectsByPrefixRequest\x12\x0e\n\x06prefix\x18\x01 \x01(\t\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"<\n\x18LoadObjectsByPrefixReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\"|\n\x1aLoadObjectsByVolumeRequest\x12\r\n\x05index\x18\x01 \x01(\r\x12\x13\n\x0bquarantined\x18\x02 \x01(\x08\x12\x12\n\npage_token\x18\x03 \x01(\t\x12\x11\n\tpage_size\x18\x04 \x01(\r\x12\x13\n\x0brepair_tool\x18\x05 \x01(\x08\"U\n\x18LoadObjectsByVolumeReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"/\n\x15ListPartitionsRequest\x12\x16\n\x0epartition_bits\x18\x01 \x01(\r\"A\n\x14ListPartitionRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12\x16\n\x0epartition_bits\x18\x02 \x01(\r\"N\n\x11ListSuffixRequest\x12\x11\n\tpartition\x18\x01 \x01(\r\x12\x0e\n\x06suffix\x18\x02 \x01(\t\x12\x16\n\x0epartition_bits\x18\x03 \x01(\r\"F\n\x1dListQuarantinedOHashesRequest\x12\x12\n\npage_token\x18\x01 \x01(\t\x12\x11\n\tpage_size\x18\x02 \x01(\r\"g\n\x1bListQuarantinedOHashesReply\x12/\n\x07objects\x18\x01 \x03(\x0b\x32\x1e.filemgr.QuarantinedObjectName\x12\x17\n\x0fnext_page_token\x18\x02 \x01(\t\"B\n\x1bListQuarantinedOHashRequest\x12\x0e\n\x06prefix\x18\x01 \x01(\t\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"=\n\x19ListQuarantinedOHashReply\x12 \n\x07objects\x18\x01 \x03(\x0b\x32\x0f.filemgr.Object\"A\n\x14GetNextOffsetRequest\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12\x13\n\x0brepair_tool\x18\x02 \x01(\x08\"$\n\x12GetNextOffsetReply\x12\x0e\n\x06offset\x18\x01 \x01(\x04\"\x11\n\x0fGetStatsRequest\"o\n\rGetStatsReply\x12\x30\n\x05stats\x18\x01 \x03(\x0b\x32!.filemgr.GetStatsReply.StatsEntry\x1a,\n\nStatsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\"\x11\n\x0fSetKvStateReply\"\x13\n\x11GetKvStateRequest\"\x1a\n\x07KvState\x12\x0f\n\x07isClean\x18\x01 \x01(\x08\"\x86\x01\n\x06Volume\x12\x14\n\x0cvolume_index\x18\x01 \x01(\r\x12(\n\x0bvolume_type\x18\x02 \x01(\x0e\x32\x13.filemgr.VolumeType\x12\x14\n\x0cvolume_state\x18\x03 \x01(\r\x12\x11\n\tpartition\x18\x04 \x01(\r\x12\x13\n\x0bnext_offset\x18\x05 \x01(\x04\"<\n\x06Object\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x14\n\x0cvolume_index\x18\x02 \x01(\r\x12\x0e\n\x06offset\x18\x03 \x01(\x04\"%\n\x15QuarantinedObjectName\x12\x0c\n\x04name\x18\x01 \x01(\t\"\x1b\n\nDirEntries\x12\r\n\x05\x65ntry\x18\x01 \x03(\t*N\n\nVolumeType\x12\x12\n\x0eVOLUME_DEFAULT\x10\x00\x12\x14\n\x10VOLUME_TOMBSTONE\x10\x01\x12\x16\n\x12VOLUME_X_DELETE_AT\x10\x02*R\n\x0bVolumeState\x12\x0c\n\x08STATE_RW\x10\x00\x12\x18\n\x14STATE_COMPACTION_SRC\x10\x01\x12\x1b\n\x17STATE_COMPACTION_TARGET\x10\x02\x62\x06proto3'
 )
 
 _VOLUMETYPE = _descriptor.EnumDescriptor(
@@ -508,8 +508,8 @@ _REGISTEROBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.RegisterObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -593,8 +593,8 @@ _UNREGISTEROBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.UnregisterObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -657,15 +657,15 @@ _RENAMEOBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.RenameObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='new_name', full_name='filemgr.RenameObjectRequest.new_name', index=1,
-      number=2, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -728,8 +728,8 @@ _LOADOBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.LoadObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -774,8 +774,8 @@ _LOADOBJECTREPLY = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.LoadObjectReply.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -820,8 +820,8 @@ _QUARANTINEOBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.QuarantineObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -884,8 +884,8 @@ _UNQUARANTINEOBJECTREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.UnquarantineObjectRequest.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -948,8 +948,8 @@ _LOADOBJECTSBYPREFIXREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='prefix', full_name='filemgr.LoadObjectsByPrefixRequest.prefix', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1033,8 +1033,8 @@ _LOADOBJECTSBYVOLUMEREQUEST = _descriptor.Descriptor(
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='page_token', full_name='filemgr.LoadObjectsByVolumeRequest.page_token', index=2,
-      number=3, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=3, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1086,8 +1086,8 @@ _LOADOBJECTSBYVOLUMEREPLY = _descriptor.Descriptor(
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='next_page_token', full_name='filemgr.LoadObjectsByVolumeReply.next_page_token', index=1,
-      number=2, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1196,8 +1196,8 @@ _LISTSUFFIXREQUEST = _descriptor.Descriptor(
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='suffix', full_name='filemgr.ListSuffixRequest.suffix', index=1,
-      number=2, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1235,8 +1235,8 @@ _LISTQUARANTINEDOHASHESREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='page_token', full_name='filemgr.ListQuarantinedOHashesRequest.page_token', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1281,8 +1281,8 @@ _LISTQUARANTINEDOHASHESREPLY = _descriptor.Descriptor(
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='next_page_token', full_name='filemgr.ListQuarantinedOHashesReply.next_page_token', index=1,
-      number=2, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1313,8 +1313,8 @@ _LISTQUARANTINEDOHASHREQUEST = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='prefix', full_name='filemgr.ListQuarantinedOHashRequest.prefix', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1692,8 +1692,8 @@ _OBJECT = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.Object.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -1738,8 +1738,8 @@ _QUARANTINEDOBJECTNAME = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='name', full_name='filemgr.QuarantinedObjectName.name', index=0,
-      number=1, type=12, cpp_type=9, label=1,
-      has_default_value=False, default_value=b"",
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
