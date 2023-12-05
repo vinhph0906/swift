@@ -25,7 +25,7 @@ class UnixHTTPConnection(httplib.HTTPConnection):
 
     def __init__(self, path, host='localhost', port=None, strict=None,
                  timeout=None):
-        httplib.HTTPConnection.__init__(self, host, port=port, strict=strict,
+        httplib.HTTPConnection.__init__(self, host, port=port,
                                         timeout=timeout)
         self.path = path
 
