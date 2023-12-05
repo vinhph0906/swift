@@ -16,7 +16,6 @@
 
 import json
 import unittest
-from contextlib import contextmanager
 from base64 import b64encode as _b64encode
 from time import time
 
@@ -25,7 +24,8 @@ from six.moves.urllib.parse import quote, urlparse
 from swift.common.middleware import tempauth as auth
 from swift.common.middleware.acl import format_acl
 from swift.common.swob import Request, Response
-from swift.common.utils import split_path
+from swift.common.utils import split_path, StatsdClient
+from test.unit import FakeMemcache
 
 NO_CONTENT_RESP = (('204 No Content', {}, ''),)   # mock server response
 
@@ -34,42 +34,6 @@ def b64encode(str_or_bytes):
     if not isinstance(str_or_bytes, bytes):
         str_or_bytes = str_or_bytes.encode('utf8')
     return _b64encode(str_or_bytes).decode('ascii')
-
-
-class FakeMemcache(object):
-
-    def __init__(self):
-        self.store = {}
-
-    def get(self, key):
-        return self.store.get(key)
-
-    def set(self, key, value, time=0):
-        if isinstance(value, (tuple, list)):
-            decoded = []
-            for elem in value:
-                if isinstance(elem, bytes):
-                    decoded.append(elem.decode('utf8'))
-                else:
-                    decoded.append(elem)
-            value = tuple(decoded)
-        self.store[key] = value
-        return True
-
-    def incr(self, key, time=0):
-        self.store[key] = self.store.setdefault(key, 0) + 1
-        return self.store[key]
-
-    @contextmanager
-    def soft_lock(self, key, timeout=0, retries=5):
-        yield True
-
-    def delete(self, key):
-        try:
-            del self.store[key]
-        except Exception:
-            pass
-        return True
 
 
 class FakeApp(object):
@@ -132,6 +96,34 @@ class TestAuth(unittest.TestCase):
         req = Request.blank(path, **kwargs)
         req.environ['swift.cache'] = FakeMemcache()
         return req
+
+    def test_statsd_prefix(self):
+        app = FakeApp()
+        ath = auth.filter_factory({'log_statsd_host': 'example.com'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('tempauth.AUTH_.',
+                         ath.logger.logger.statsd_client._prefix)
+
+        ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
+                                   'log_name': 'bar',
+                                   'log_statsd_host': 'example.com'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('foo.tempauth.AUTH_.',
+                         ath.logger.logger.statsd_client._prefix)
+
+        ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
+                                   'log_name': 'bar',
+                                   'log_statsd_host': 'example.com',
+                                   'reseller_prefix': 'TEST'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('foo.tempauth.TEST_.',
+                         ath.logger.logger.statsd_client._prefix)
 
     def test_reseller_prefix_init(self):
         app = FakeApp()
@@ -537,7 +529,7 @@ class TestAuth(unittest.TestCase):
 
     def test_account_put_permissions(self):
         self.test_auth = auth.filter_factory({})(
-            FakeApp(iter(NO_CONTENT_RESP * 4)))
+            FakeApp(iter(NO_CONTENT_RESP * 5)))
         req = self._make_request('/v1/AUTH_new',
                                  environ={'REQUEST_METHOD': 'PUT'})
         req.remote_user = 'act:usr,act'
@@ -563,6 +555,12 @@ class TestAuth(unittest.TestCase):
         resp = self.test_auth.authorize(req)
         self.assertIsNone(resp)
 
+        req = self._make_request('/v1/AUTH_new',
+                                 environ={'REQUEST_METHOD': 'PUT'})
+        req.remote_user = 'act:usr,act,.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertEqual(resp.status_int, 403)
+
         # .super_admin is not something the middleware should ever see or care
         # about
         req = self._make_request('/v1/AUTH_new',
@@ -573,7 +571,7 @@ class TestAuth(unittest.TestCase):
 
     def test_account_delete_permissions(self):
         self.test_auth = auth.filter_factory({})(
-            FakeApp(iter(NO_CONTENT_RESP * 4)))
+            FakeApp(iter(NO_CONTENT_RESP * 5)))
         req = self._make_request('/v1/AUTH_new',
                                  environ={'REQUEST_METHOD': 'DELETE'})
         req.remote_user = 'act:usr,act'
@@ -599,6 +597,12 @@ class TestAuth(unittest.TestCase):
         resp = self.test_auth.authorize(req)
         self.assertIsNone(resp)
 
+        req = self._make_request('/v1/AUTH_new',
+                                 environ={'REQUEST_METHOD': 'DELETE'})
+        req.remote_user = 'act:usr,act,.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertEqual(resp.status_int, 403)
+
         # .super_admin is not something the middleware should ever see or care
         # about
         req = self._make_request('/v1/AUTH_new',
@@ -622,6 +626,15 @@ class TestAuth(unittest.TestCase):
         self.assertAlmostEqual(int(resp.headers['x-auth-token-expires']),
                                auth.DEFAULT_TOKEN_LIFE - 0.5, delta=0.5)
         self.assertGreater(len(resp.headers['x-auth-token']), 10)
+
+    def test_get_token_memcache_error(self):
+        test_auth = auth.filter_factory({'user_ac_user': 'testing'})(FakeApp())
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'})
+        req.environ['swift.cache'] = FakeMemcache(error_on_set=[True])
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 503)
 
     def test_get_token_success_other_auth_prefix(self):
         test_auth = auth.filter_factory({'user_ac_user': 'testing',
@@ -824,8 +837,17 @@ class TestAuth(unittest.TestCase):
         req = self._make_request('/v1/AUTH_cfa',
                                  headers={'X-Auth-Token': 'AUTH_t'})
         req.remote_user = '.reseller_admin'
-        self.test_auth.authorize(req)
+        resp = self.test_auth.authorize(req)
+        self.assertIsNone(resp)
         self.assertEqual(owner_values, [True])
+
+        owner_values = []
+        req = self._make_request('/v1/AUTH_cfa',
+                                 headers={'X-Auth-Token': 'AUTH_t'})
+        req.remote_user = '.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertIsNone(resp)
+        self.assertEqual(owner_values, [False])
 
     def test_admin_is_owner(self):
         orig_authorize = self.test_auth.authorize
@@ -1172,12 +1194,17 @@ class TestParseUserCreation(unittest.TestCase):
             'user_test_tester3': 'testing',
             'user_has_url': 'urlly .admin http://a.b/v1/DEF_has',
             'user_admin_admin': 'admin .admin .reseller_admin',
+            'user_admin_auditor': 'admin_ro .reseller_reader',
         })(FakeApp())
         self.assertEqual(auth_filter.users, {
             'admin:admin': {
                 'url': '$HOST/v1/ABC_admin',
                 'groups': ['.admin', '.reseller_admin'],
                 'key': 'admin'
+            }, 'admin:auditor': {
+                'url': '$HOST/v1/ABC_admin',
+                'groups': ['.reseller_reader'],
+                'key': 'admin_ro'
             }, 'test:tester3': {
                 'url': '$HOST/v1/ABC_test',
                 'groups': [],
@@ -1219,6 +1246,14 @@ class TestParseUserCreation(unittest.TestCase):
             'user_bob_bobby': '',
             'user_admin_admin': 'admin .admin .reseller_admin',
         }), FakeApp())
+
+    def test_account_with_no_user(self):
+        expected_msg = 'key user_testtester was provided in an invalid format'
+        with self.assertRaises(ValueError) as ctx:
+            auth.filter_factory({
+                'user_testtester': 'testing',
+            })(FakeApp())
+        self.assertEqual(str(ctx.exception), expected_msg)
 
 
 class TestAccountAcls(unittest.TestCase):
@@ -1614,6 +1649,16 @@ class ServiceTokenFunctionality(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         resp = self._make_authed_request(
             {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,AUTH_admin,.reseller_reader',
+            '/v1/AUTH_acct', method='GET')
+        self.assertEqual(resp.status_int, 200)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,AUTH_admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='GET')
+        self.assertEqual(resp.status_int, 200)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
             'admin:mary,admin,AUTH_admin,.reseller_admin',
             '/v1/AUTH_acct', method='GET')
         self.assertEqual(resp.status_int, 200)
@@ -1640,6 +1685,26 @@ class ServiceTokenFunctionality(unittest.TestCase):
             'acct:joe,acct,AUTH_acct',
             '/v1/AUTH_acct',
             method='DELETE')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct', method='PUT')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct', method='DELETE')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='PUT')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='DELETE')
         self.assertEqual(resp.status_int, 403)
 
     def test_authed_for_primary_path_multiple(self):

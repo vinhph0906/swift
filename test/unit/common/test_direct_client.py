@@ -18,7 +18,6 @@ import json
 import unittest
 import os
 from contextlib import contextmanager
-from hashlib import md5
 import time
 import pickle
 
@@ -29,12 +28,13 @@ from swift.common import direct_client
 from swift.common.direct_client import DirectClientException
 from swift.common.exceptions import ClientException
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import Timestamp, quote
+from swift.common.utils import Timestamp, quote, md5
 from swift.common.swob import RESPONSE_REASONS
 from swift.common.storage_policy import POLICIES
 from six.moves.http_client import HTTPException
 
-from test.unit import patch_policies, debug_logger
+from test.debug_logger import debug_logger
+from test.unit import patch_policies
 
 
 class FakeConn(object):
@@ -81,17 +81,17 @@ class FakeConn(object):
 
     def send(self, data):
         if not self.etag:
-            self.etag = md5()
+            self.etag = md5(usedforsecurity=False)
         self.etag.update(data)
 
 
 @contextmanager
 def mocked_http_conn(*args, **kwargs):
+    mocked = kwargs.pop('mocked', 'swift.common.bufferedhttp.http_connect_raw')
     fake_conn = FakeConn(*args, **kwargs)
     mock_http_conn = lambda *args, **kwargs: \
         fake_conn._update_raw_call_args(*args, **kwargs)
-    with mock.patch('swift.common.bufferedhttp.http_connect_raw',
-                    new=mock_http_conn):
+    with mock.patch(mocked, new=mock_http_conn):
         yield fake_conn
 
 
@@ -316,6 +316,31 @@ class TestDirectClient(unittest.TestCase):
             self.assertIn('X-Timestamp', headers)
             self.assertIn('User-Agent', headers)
 
+    def test_direct_delete_account_replication_net(self):
+        part = '0'
+        account = 'a'
+
+        mock_path = 'swift.common.bufferedhttp.http_connect_raw'
+        with mock.patch(mock_path) as fake_connect:
+            fake_connect.return_value.getresponse.return_value.status = 200
+            direct_client.direct_delete_account(
+                self.node, part, account,
+                headers={'X-Backend-Use-Replication-Network': 't'})
+            args, kwargs = fake_connect.call_args
+            ip = args[0]
+            self.assertEqual(self.node['replication_ip'], ip)
+            self.assertNotEqual(self.node['ip'], ip)
+            port = args[1]
+            self.assertEqual(self.node['replication_port'], port)
+            self.assertNotEqual(self.node['port'], port)
+            method = args[2]
+            self.assertEqual('DELETE', method)
+            path = args[3]
+            self.assertEqual('/sda/0/a', path)
+            headers = args[4]
+            self.assertIn('X-Timestamp', headers)
+            self.assertIn('User-Agent', headers)
+
     def test_direct_delete_account_failure(self):
         part = '0'
         account = 'a'
@@ -339,6 +364,24 @@ class TestDirectClient(unittest.TestCase):
                 self.node, self.part, self.account, self.container)
             self.assertEqual(conn.host, self.node['ip'])
             self.assertEqual(conn.port, self.node['port'])
+            self.assertEqual(conn.method, 'HEAD')
+            self.assertEqual(conn.path, self.container_path)
+
+        self.assertEqual(conn.req_headers['user-agent'],
+                         self.user_agent)
+        self.assertEqual(headers, resp)
+
+    def test_direct_head_container_replication_net(self):
+        headers = HeaderKeyDict(key='value')
+
+        with mocked_http_conn(200, headers) as conn:
+            resp = direct_client.direct_head_container(
+                self.node, self.part, self.account, self.container,
+                headers={'X-Backend-Use-Replication-Network': 'on'})
+            self.assertEqual(conn.host, self.node['replication_ip'])
+            self.assertEqual(conn.port, self.node['replication_port'])
+            self.assertNotEqual(conn.host, self.node['ip'])
+            self.assertNotEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'HEAD')
             self.assertEqual(conn.path, self.container_path)
 
@@ -441,6 +484,18 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.method, 'DELETE')
             self.assertEqual(conn.path, self.container_path)
 
+    def test_direct_delete_container_replication_net(self):
+        with mocked_http_conn(200) as conn:
+            direct_client.direct_delete_container(
+                self.node, self.part, self.account, self.container,
+                headers={'X-Backend-Use-Replication-Network': '1'})
+            self.assertEqual(conn.host, self.node['replication_ip'])
+            self.assertEqual(conn.port, self.node['replication_port'])
+            self.assertNotEqual(conn.host, self.node['ip'])
+            self.assertNotEqual(conn.port, self.node['port'])
+            self.assertEqual(conn.method, 'DELETE')
+            self.assertEqual(conn.path, self.container_path)
+
     def test_direct_delete_container_with_timestamp(self):
         # ensure timestamp is different from any that might be auto-generated
         timestamp = Timestamp(time.time() - 100)
@@ -491,7 +546,9 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.req_headers['User-Agent'], 'my UA')
             self.assertTrue('x-timestamp' in conn.req_headers)
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
-            self.assertEqual(md5(body).hexdigest(), conn.etag.hexdigest())
+            self.assertEqual(
+                md5(body, usedforsecurity=False).hexdigest(),
+                conn.etag.hexdigest())
         self.assertIsNone(rv)
 
     def test_direct_put_container_chunked(self):
@@ -513,8 +570,9 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual('bar', conn.req_headers.get('x-foo'))
             self.assertNotIn('Content-Length', conn.req_headers)
             expected_sent = b'%0x\r\n%s\r\n0\r\n\r\n' % (len(body), body)
-            self.assertEqual(md5(expected_sent).hexdigest(),
-                             conn.etag.hexdigest())
+            self.assertEqual(
+                md5(expected_sent, usedforsecurity=False).hexdigest(),
+                conn.etag.hexdigest())
         self.assertIsNone(rv)
 
     def test_direct_put_container_fail(self):
@@ -794,7 +852,9 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
-        self.assertEqual(md5(b'123456').hexdigest(), resp)
+        self.assertEqual(
+            md5(b'123456', usedforsecurity=False).hexdigest(),
+            resp)
 
     def test_direct_put_object_fail(self):
         contents = io.BytesIO(b'123456')
@@ -821,7 +881,10 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual(conn.method, 'PUT')
             self.assertEqual(conn.path, self.obj_path)
-        self.assertEqual(md5(b'6\r\n123456\r\n0\r\n\r\n').hexdigest(), resp)
+        self.assertEqual(
+            md5(b'6\r\n123456\r\n0\r\n\r\n',
+                usedforsecurity=False).hexdigest(),
+            resp)
 
     def test_direct_put_object_args(self):
         # One test to cover all missing checks
@@ -836,7 +899,9 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(self.obj_path, conn.path)
             self.assertEqual(conn.req_headers['Content-Length'], '0')
             self.assertEqual(conn.req_headers['Content-Type'], 'Text')
-        self.assertEqual(md5(b'0\r\n\r\n').hexdigest(), resp)
+        self.assertEqual(
+            md5(b'0\r\n\r\n', usedforsecurity=False).hexdigest(),
+            resp)
 
     def test_direct_put_object_header_content_length(self):
         contents = io.BytesIO(b'123456')
@@ -851,7 +916,9 @@ class TestDirectClient(unittest.TestCase):
             self.assertEqual(conn.port, self.node['port'])
             self.assertEqual('PUT', conn.method)
             self.assertEqual(conn.req_headers['Content-length'], '6')
-        self.assertEqual(md5(b'123456').hexdigest(), resp)
+        self.assertEqual(
+            md5(b'123456', usedforsecurity=False).hexdigest(),
+            resp)
 
     def test_retry(self):
         headers = HeaderKeyDict({'key': 'value'})
@@ -912,6 +979,36 @@ class TestDirectClient(unittest.TestCase):
         self.assertEqual(3, len(error_lines))
         for line in error_lines:
             self.assertIn('Kaboom!', line)
+
+    def test_direct_get_recon(self):
+        data = {
+            "/etc/swift/account.ring.gz": "de7316d2809205fa13ebfc747566260c",
+            "/etc/swift/container.ring.gz": "8e63c916fec81825cc40940eefe1d058",
+            "/etc/swift/object.ring.gz": "a77f51c14bbf7075bb7be0c27fd00dc4",
+            "/etc/swift/object-1.ring.gz": "f0222326f80ee5cb34b7546b18727923",
+            "/etc/swift/object-2.ring.gz": "2228dc8a7ff1cf2eb89b116653ac6191"}
+        body = json.dumps(data)
+        with mocked_http_conn(
+                200, {}, body,
+                mocked='swift.common.direct_client.http_connect_raw') as conn:
+            resp = direct_client.direct_get_recon(self.node, "ringmd5")
+        self.assertEqual(conn.method, 'GET')
+        self.assertEqual(conn.path, '/recon/ringmd5')
+        self.assertEqual(conn.host, self.node['ip'])
+        self.assertEqual(conn.port, self.node['port'])
+        self.assertEqual(data, resp)
+
+        # Now check failure
+        with mocked_http_conn(
+                500,
+                mocked='swift.common.direct_client.http_connect_raw') as conn:
+            with self.assertRaises(ClientException) as raised:
+                resp = direct_client.direct_get_recon(self.node, "ringmd5")
+        self.assertEqual(conn.host, self.node['ip'])
+        self.assertEqual(conn.port, self.node['port'])
+        self.assertEqual(conn.method, 'GET')
+        self.assertEqual(conn.path, '/recon/ringmd5')
+        self.assertEqual(raised.exception.http_status, 500)
 
 
 class TestUTF8DirectClient(TestDirectClient):

@@ -27,9 +27,9 @@ from swift.common.utils import Timestamp
 from swift.obj import ssync_sender, diskfile, ssync_receiver
 from swift.obj.replicator import ObjectReplicator
 
+from test.debug_logger import debug_logger
 from test.unit.obj.common import BaseTest
-from test.unit import patch_policies, make_timestamp_iter, skip_if_no_xattrs, \
-    debug_logger
+from test.unit import patch_policies, make_timestamp_iter, skip_if_no_xattrs
 
 
 class NullBufferedHTTPConnection(object):
@@ -55,7 +55,7 @@ class NullBufferedHTTPConnection(object):
 
 class FakeResponse(ssync_sender.SsyncBufferedHTTPResponse):
 
-    def __init__(self, chunk_body=''):
+    def __init__(self, chunk_body='', headers=None):
         self.status = 200
         self.close_called = False
         if not six.PY2:
@@ -65,12 +65,19 @@ class FakeResponse(ssync_sender.SsyncBufferedHTTPResponse):
                 b'%x\r\n%s\r\n0\r\n\r\n' % (len(chunk_body), chunk_body))
         self.ssync_response_buffer = b''
         self.ssync_response_chunk_left = 0
+        self.headers = headers or {}
 
     def read(self, *args, **kwargs):
         return b''
 
     def close(self):
         self.close_called = True
+
+    def getheader(self, header_name, default=None):
+        return str(self.headers.get(header_name, default))
+
+    def getheaders(self):
+        return self.headers.items()
 
 
 class FakeConnection(object):
@@ -95,8 +102,10 @@ class TestSender(BaseTest):
         self.daemon_logger = debug_logger('test-ssync-sender')
         self.daemon = ObjectReplicator(self.daemon_conf,
                                        self.daemon_logger)
-        job = {'policy': POLICIES.legacy}  # sufficient for Sender.__init__
-        self.sender = ssync_sender.Sender(self.daemon, None, job, None)
+        self.job = {'policy': POLICIES.legacy,
+                    'device': 'test-dev',
+                    'partition': '99'}  # sufficient for Sender.__init__
+        self.sender = ssync_sender.Sender(self.daemon, None, self.job, None)
 
     def test_call_catches_MessageTimeout(self):
 
@@ -379,6 +388,56 @@ class TestSender(BaseTest):
                              'connection method "%s" got %r not %r' % (
                                  method_name, mock_method.mock_calls,
                                  expected_calls))
+
+    def _do_test_connect_include_non_durable(self,
+                                             include_non_durable,
+                                             resp_headers):
+        # construct sender and make connect call
+        node = dict(replication_ip='1.2.3.4', replication_port=5678,
+                    device='sda1', backend_index=0)
+        job = dict(partition='9', policy=POLICIES[1])
+        sender = ssync_sender.Sender(self.daemon, node, job, None,
+                                     include_non_durable=include_non_durable)
+        self.assertEqual(include_non_durable, sender.include_non_durable)
+        with mock.patch(
+                'swift.obj.ssync_sender.SsyncBufferedHTTPConnection'
+        ) as mock_conn_class:
+            mock_conn = mock_conn_class.return_value
+            mock_conn.getresponse.return_value = FakeResponse('', resp_headers)
+            sender.connect()
+        mock_conn_class.assert_called_once_with('1.2.3.4:5678')
+        return sender
+
+    def test_connect_legacy_receiver(self):
+        sender = self._do_test_connect_include_non_durable(False, {})
+        self.assertFalse(sender.include_non_durable)
+        warnings = self.daemon_logger.get_lines_for_level('warning')
+        self.assertEqual([], warnings)
+
+    def test_connect_upgraded_receiver(self):
+        resp_hdrs = {'x-backend-accept-no-commit': 'True'}
+        sender = self._do_test_connect_include_non_durable(False, resp_hdrs)
+        # 'x-backend-accept-no-commit' in response does not override
+        # sender.include_non_durable
+        self.assertFalse(sender.include_non_durable)
+        warnings = self.daemon_logger.get_lines_for_level('warning')
+        self.assertEqual([], warnings)
+
+    def test_connect_legacy_receiver_include_non_durable(self):
+        sender = self._do_test_connect_include_non_durable(True, {})
+        # no 'x-backend-accept-no-commit' in response,
+        # sender.include_non_durable has been overridden
+        self.assertFalse(sender.include_non_durable)
+        warnings = self.daemon_logger.get_lines_for_level('warning')
+        self.assertEqual(['ssync receiver 1.2.3.4:5678 does not accept '
+                          'non-durable fragments'], warnings)
+
+    def test_connect_upgraded_receiver_include_non_durable(self):
+        resp_hdrs = {'x-backend-accept-no-commit': 'True'}
+        sender = self._do_test_connect_include_non_durable(True, resp_hdrs)
+        self.assertTrue(sender.include_non_durable)
+        warnings = self.daemon_logger.get_lines_for_level('warning')
+        self.assertEqual([], warnings)
 
     def test_call(self):
         def patch_sender(sender, available_map, send_map):
@@ -731,13 +790,43 @@ class TestSender(BaseTest):
         self.assertEqual(response.readline(), b'')
         self.assertEqual(response.readline(), b'')
 
-    def test_missing_check_timeout(self):
+    def test_missing_check_timeout_start(self):
         connection = FakeConnection()
-        connection.send = lambda d: eventlet.sleep(1)
         response = FakeResponse()
         self.sender.daemon.node_timeout = 0.01
-        self.assertRaises(exceptions.MessageTimeout, self.sender.missing_check,
-                          connection, response)
+        self.assertFalse(self.sender.limited_by_max_objects)
+        with mock.patch.object(connection, 'send',
+                               side_effect=lambda *args: eventlet.sleep(1)):
+            with self.assertRaises(exceptions.MessageTimeout) as cm:
+                self.sender.missing_check(connection, response)
+        self.assertIn('0.01 seconds: missing_check start', str(cm.exception))
+        self.assertFalse(self.sender.limited_by_max_objects)
+
+    def test_missing_check_timeout_send_line(self):
+        def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
+            yield (
+                '9d41d8cd98f00b204e9800998ecf0abc',
+                {'ts_data': Timestamp(1380144470.00000)})
+            yield (
+                '9d41d8cd98f00b204e9800998ecf0def',
+                {'ts_data': Timestamp(1380144471.00000)})
+        connection = FakeConnection()
+        response = FakeResponse()
+        # max_objects unlimited
+        self.sender = ssync_sender.Sender(self.daemon, None, self.job, None,
+                                          max_objects=0)
+        self.sender.daemon.node_timeout = 0.01
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
+        sleeps = [0, 0, 1]
+        with mock.patch.object(
+                connection, 'send',
+                side_effect=lambda *args: eventlet.sleep(sleeps.pop(0))):
+            with self.assertRaises(exceptions.MessageTimeout) as cm:
+                self.sender.missing_check(connection, response)
+        self.assertIn('0.01 seconds: missing_check send line: '
+                      '1 lines (57 bytes) sent', str(cm.exception))
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_has_empty_suffixes(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -761,6 +850,7 @@ class TestSender(BaseTest):
                 ':MISSING_CHECK: START\r\n'
                 ':MISSING_CHECK: END\r\n'))
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         available_map, send_map = self.sender.missing_check(connection,
                                                             response)
         self.assertEqual(
@@ -769,6 +859,7 @@ class TestSender(BaseTest):
             b'15\r\n:MISSING_CHECK: END\r\n\r\n')
         self.assertEqual(send_map, {})
         self.assertEqual(available_map, {})
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_has_suffixes(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -792,6 +883,10 @@ class TestSender(BaseTest):
                     'No match for %r %r %r %r' % (device, partition,
                                                   policy, suffixes))
 
+        # note: max_objects > number that would yield
+        self.sender = ssync_sender.Sender(self.daemon, None, self.job, None,
+                                          max_objects=4)
+
         connection = FakeConnection()
         self.sender.job = {
             'device': 'dev',
@@ -804,6 +899,7 @@ class TestSender(BaseTest):
                 ':MISSING_CHECK: START\r\n'
                 ':MISSING_CHECK: END\r\n'))
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         available_map, send_map = self.sender.missing_check(connection,
                                                             response)
         self.assertEqual(
@@ -826,6 +922,126 @@ class TestSender(BaseTest):
                             ts_meta=Timestamp(1380144475.44444),
                             ts_ctype=Timestamp(1380144474.44448)))]
         self.assertEqual(available_map, dict(candidates))
+        self.assertEqual([], self.daemon_logger.get_lines_for_level('info'))
+        self.assertFalse(self.sender.limited_by_max_objects)
+
+    def test_missing_check_max_objects_less_than_actual_objects(self):
+        def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
+            # verify missing_check stops after 2 objects even though more
+            # objects would yield
+            if (device == 'dev' and partition == '9' and
+                    policy == POLICIES.legacy and
+                    suffixes == ['abc', 'def']):
+                yield (
+                    '9d41d8cd98f00b204e9800998ecf0abc',
+                    {'ts_data': Timestamp(1380144470.00000)})
+                yield (
+                    '9d41d8cd98f00b204e9800998ecf0def',
+                    {'ts_data': Timestamp(1380144472.22222),
+                     'ts_meta': Timestamp(1380144473.22222)})
+                yield (
+                    '9d41d8cd98f00b204e9800998ecf1def',
+                    {'ts_data': Timestamp(1380144474.44444),
+                     'ts_ctype': Timestamp(1380144474.44448),
+                     'ts_meta': Timestamp(1380144475.44444)})
+            else:
+                raise Exception(
+                    'No match for %r %r %r %r' % (device, partition,
+                                                  policy, suffixes))
+
+        # max_objects < number that would yield
+        self.sender = ssync_sender.Sender(self.daemon, None, self.job, None,
+                                          max_objects=2)
+
+        connection = FakeConnection()
+        self.sender.job = {
+            'device': 'dev',
+            'partition': '9',
+            'policy': POLICIES.legacy,
+        }
+        self.sender.suffixes = ['abc', 'def']
+        response = FakeResponse(
+            chunk_body=(
+                ':MISSING_CHECK: START\r\n'
+                ':MISSING_CHECK: END\r\n'))
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(
+            b''.join(connection.sent),
+            b'17\r\n:MISSING_CHECK: START\r\n\r\n'
+            b'33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
+            b'3b\r\n9d41d8cd98f00b204e9800998ecf0def 1380144472.22222 '
+            b'm:186a0\r\n\r\n'
+            b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertEqual(send_map, {})
+        candidates = [('9d41d8cd98f00b204e9800998ecf0abc',
+                       dict(ts_data=Timestamp(1380144470.00000))),
+                      ('9d41d8cd98f00b204e9800998ecf0def',
+                       dict(ts_data=Timestamp(1380144472.22222),
+                            ts_meta=Timestamp(1380144473.22222)))]
+        self.assertEqual(available_map, dict(candidates))
+        self.assertEqual(
+            ['ssync missing_check truncated after 2 objects: device: dev, '
+             'part: 9, policy: 0, last object hash: '
+             '9d41d8cd98f00b204e9800998ecf0def'],
+            self.daemon_logger.get_lines_for_level('info'))
+        self.assertTrue(self.sender.limited_by_max_objects)
+
+    def test_missing_check_max_objects_exactly_actual_objects(self):
+        def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
+            if (device == 'dev' and partition == '9' and
+                    policy == POLICIES.legacy and
+                    suffixes == ['abc', 'def']):
+                yield (
+                    '9d41d8cd98f00b204e9800998ecf0abc',
+                    {'ts_data': Timestamp(1380144470.00000)})
+                yield (
+                    '9d41d8cd98f00b204e9800998ecf0def',
+                    {'ts_data': Timestamp(1380144472.22222),
+                     'ts_meta': Timestamp(1380144473.22222)})
+            else:
+                raise Exception(
+                    'No match for %r %r %r %r' % (device, partition,
+                                                  policy, suffixes))
+
+        # max_objects == number that would yield
+        self.sender = ssync_sender.Sender(self.daemon, None, self.job, None,
+                                          max_objects=2)
+
+        connection = FakeConnection()
+        self.sender.job = {
+            'device': 'dev',
+            'partition': '9',
+            'policy': POLICIES.legacy,
+        }
+        self.sender.suffixes = ['abc', 'def']
+        response = FakeResponse(
+            chunk_body=(
+                ':MISSING_CHECK: START\r\n'
+                ':MISSING_CHECK: END\r\n'))
+        self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(
+            b''.join(connection.sent),
+            b'17\r\n:MISSING_CHECK: START\r\n\r\n'
+            b'33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
+            b'3b\r\n9d41d8cd98f00b204e9800998ecf0def 1380144472.22222 '
+            b'm:186a0\r\n\r\n'
+            b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertEqual(send_map, {})
+        candidates = [('9d41d8cd98f00b204e9800998ecf0abc',
+                       dict(ts_data=Timestamp(1380144470.00000))),
+                      ('9d41d8cd98f00b204e9800998ecf0def',
+                       dict(ts_data=Timestamp(1380144472.22222),
+                            ts_meta=Timestamp(1380144473.22222)))]
+        self.assertEqual(available_map, dict(candidates))
+        # nothing logged re: truncation
+        self.assertEqual([], self.daemon_logger.get_lines_for_level('info'))
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_far_end_disconnect(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -848,6 +1064,7 @@ class TestSender(BaseTest):
         }
         self.sender.suffixes = ['abc']
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         response = FakeResponse(chunk_body='\r\n')
         exc = None
         try:
@@ -860,6 +1077,7 @@ class TestSender(BaseTest):
             b'17\r\n:MISSING_CHECK: START\r\n\r\n'
             b'33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_far_end_disconnect2(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -882,6 +1100,7 @@ class TestSender(BaseTest):
         }
         self.sender.suffixes = ['abc']
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         response = FakeResponse(
             chunk_body=':MISSING_CHECK: START\r\n')
         exc = None
@@ -895,6 +1114,7 @@ class TestSender(BaseTest):
             b'17\r\n:MISSING_CHECK: START\r\n\r\n'
             b'33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_far_end_unexpected(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -917,6 +1137,7 @@ class TestSender(BaseTest):
         }
         self.sender.suffixes = ['abc']
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         response = FakeResponse(chunk_body='OH HAI\r\n')
         exc = None
         try:
@@ -929,6 +1150,7 @@ class TestSender(BaseTest):
             b'17\r\n:MISSING_CHECK: START\r\n\r\n'
             b'33\r\n9d41d8cd98f00b204e9800998ecf0abc 1380144470.00000\r\n\r\n'
             b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_send_map(self):
         def yield_hashes(device, partition, policy, suffixes=None, **kwargs):
@@ -956,6 +1178,7 @@ class TestSender(BaseTest):
                 '0123abc dm\r\n'
                 ':MISSING_CHECK: END\r\n'))
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         available_map, send_map = self.sender.missing_check(connection,
                                                             response)
         self.assertEqual(
@@ -967,6 +1190,7 @@ class TestSender(BaseTest):
         self.assertEqual(available_map,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_missing_check_extra_line_parts(self):
         # check that sender tolerates extra parts in missing check
@@ -996,12 +1220,14 @@ class TestSender(BaseTest):
                 '0123abc d extra response parts\r\n'
                 ':MISSING_CHECK: END\r\n'))
         self.sender.df_mgr.yield_hashes = yield_hashes
+        self.assertFalse(self.sender.limited_by_max_objects)
         available_map, send_map = self.sender.missing_check(connection,
                                                             response)
         self.assertEqual(send_map, {'0123abc': {'data': True}})
         self.assertEqual(available_map,
                          dict([('9d41d8cd98f00b204e9800998ecf0abc',
                                 {'ts_data': Timestamp(1380144470.00000)})]))
+        self.assertFalse(self.sender.limited_by_max_objects)
 
     def test_updates_timeout(self):
         connection = FakeConnection()
@@ -1465,7 +1691,7 @@ class TestSender(BaseTest):
             exc = err
         self.assertEqual(str(exc), '0.01 seconds: send_put chunk')
 
-    def _check_send_put(self, obj_name, meta_value):
+    def _check_send_put(self, obj_name, meta_value, durable=True):
         ts_iter = make_timestamp_iter()
         t1 = next(ts_iter)
         body = b'test'
@@ -1473,7 +1699,8 @@ class TestSender(BaseTest):
                           u'Unicode-Meta-Name': meta_value}
         df = self._make_open_diskfile(obj=obj_name, body=body,
                                       timestamp=t1,
-                                      extra_metadata=extra_metadata)
+                                      extra_metadata=extra_metadata,
+                                      commit=durable)
         expected = dict(df.get_metadata())
         expected['body'] = body if six.PY2 else body.decode('ascii')
         expected['chunk_size'] = len(body)
@@ -1481,14 +1708,17 @@ class TestSender(BaseTest):
         wire_meta = meta_value if six.PY2 else meta_value.encode('utf8')
         path = six.moves.urllib.parse.quote(expected['name'])
         expected['path'] = path
-        expected['length'] = format(145 + len(path) + len(wire_meta), 'x')
+        no_commit = '' if durable else 'X-Backend-No-Commit: True\r\n'
+        expected['no_commit'] = no_commit
+        length = 145 + len(path) + len(wire_meta) + len(no_commit)
+        expected['length'] = format(length, 'x')
         # .meta file metadata is not included in expected for data only PUT
         t2 = next(ts_iter)
         metadata = {'X-Timestamp': t2.internal, 'X-Object-Meta-Fruit': 'kiwi'}
         df.write_metadata(metadata)
         df.open()
         connection = FakeConnection()
-        self.sender.send_put(connection, path, df)
+        self.sender.send_put(connection, path, df, durable=durable)
         expected = (
             '%(length)s\r\n'
             'PUT %(path)s\r\n'
@@ -1496,6 +1726,7 @@ class TestSender(BaseTest):
             'ETag: %(ETag)s\r\n'
             'Some-Other-Header: value\r\n'
             'Unicode-Meta-Name: %(meta)s\r\n'
+            '%(no_commit)s'
             'X-Timestamp: %(X-Timestamp)s\r\n'
             '\r\n'
             '\r\n'
@@ -1507,6 +1738,9 @@ class TestSender(BaseTest):
 
     def test_send_put(self):
         self._check_send_put('o', 'meta')
+
+    def test_send_put_non_durable(self):
+        self._check_send_put('o', 'meta', durable=False)
 
     def test_send_put_unicode(self):
         if six.PY2:
@@ -1575,6 +1809,174 @@ class TestSender(BaseTest):
         self.assertTrue(connection.closed)
 
 
+@patch_policies(with_ec_default=True)
+class TestSenderEC(BaseTest):
+    def setUp(self):
+        skip_if_no_xattrs()
+        super(TestSenderEC, self).setUp()
+        self.daemon_logger = debug_logger('test-ssync-sender')
+        self.daemon = ObjectReplicator(self.daemon_conf,
+                                       self.daemon_logger)
+        job = {'policy': POLICIES.legacy}  # sufficient for Sender.__init__
+        self.sender = ssync_sender.Sender(self.daemon, None, job, None)
+
+    def test_missing_check_non_durable(self):
+        # sender has durable and non-durable data files for frag index 2
+        ts_iter = make_timestamp_iter()
+        frag_index = 2
+        device = 'dev'
+        part = '9'
+        object_parts = ('a', 'c', 'o')
+        object_hash = utils.hash_path(*object_parts)
+
+        # older durable data file at t1
+        t1 = next(ts_iter)
+        df_durable = self._make_diskfile(
+            device, part, *object_parts, timestamp=t1, policy=POLICIES.default,
+            frag_index=frag_index, commit=True, verify=False)
+        with df_durable.open():
+            self.assertEqual(t1, df_durable.durable_timestamp)  # sanity
+
+        # newer non-durable data file at t2
+        t2 = next(ts_iter)
+        df_non_durable = self._make_diskfile(
+            device, part, *object_parts, timestamp=t2, policy=POLICIES.default,
+            frag_index=frag_index, commit=False, frag_prefs=[])
+        with df_non_durable.open():
+            self.assertNotEqual(df_non_durable.data_timestamp,
+                                df_non_durable.durable_timestamp)  # sanity
+
+        self.sender.job = {
+            'device': device,
+            'partition': part,
+            'policy': POLICIES.default,
+            'frag_index': frag_index,
+        }
+        self.sender.node = {}
+
+        # First call missing check with sender in default mode - expect the
+        # non-durable frag to be ignored
+        response = FakeResponse(
+            chunk_body=':MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n')
+        connection = FakeConnection()
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(
+            b''.join(connection.sent),
+            b'17\r\n:MISSING_CHECK: START\r\n\r\n'
+            b'33\r\n' + object_hash.encode('utf8') +
+            b' ' + t1.internal.encode('utf8') + b'\r\n\r\n'
+            b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertEqual(
+            available_map, {object_hash: {'ts_data': t1, 'durable': True}})
+
+        # Now make sender send non-durables and repeat missing_check - this
+        # time the durable is ignored and the non-durable is included in
+        # available_map (but NOT sent to receiver)
+        self.sender.include_non_durable = True
+        response = FakeResponse(
+            chunk_body=':MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n')
+        connection = FakeConnection()
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(
+            b''.join(connection.sent),
+            b'17\r\n:MISSING_CHECK: START\r\n\r\n'
+            b'41\r\n' + object_hash.encode('utf8') +
+            b' ' + t2.internal.encode('utf8') + b' durable:False\r\n\r\n'
+            b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertEqual(
+            available_map, {object_hash: {'ts_data': t2, 'durable': False}})
+
+        # Finally, purge the non-durable frag and repeat missing-check to
+        # confirm that the durable frag is now found and sent to receiver
+        df_non_durable.purge(t2, frag_index)
+        response = FakeResponse(
+            chunk_body=':MISSING_CHECK: START\r\n:MISSING_CHECK: END\r\n')
+        connection = FakeConnection()
+        available_map, send_map = self.sender.missing_check(connection,
+                                                            response)
+        self.assertEqual(
+            b''.join(connection.sent),
+            b'17\r\n:MISSING_CHECK: START\r\n\r\n'
+            b'33\r\n' + object_hash.encode('utf8') +
+            b' ' + t1.internal.encode('utf8') + b'\r\n\r\n'
+            b'15\r\n:MISSING_CHECK: END\r\n\r\n')
+        self.assertEqual(
+            available_map, {object_hash: {'ts_data': t1, 'durable': True}})
+
+    def test_updates_put_non_durable(self):
+        # sender has durable and non-durable data files for frag index 2 and is
+        # initialised to include non-durables
+        ts_iter = make_timestamp_iter()
+        frag_index = 2
+        device = 'dev'
+        part = '9'
+        object_parts = ('a', 'c', 'o')
+        object_hash = utils.hash_path(*object_parts)
+
+        # older durable data file
+        t1 = next(ts_iter)
+        df_durable = self._make_diskfile(
+            device, part, *object_parts, timestamp=t1, policy=POLICIES.default,
+            frag_index=frag_index, commit=True, verify=False)
+        with df_durable.open():
+            self.assertEqual(t1, df_durable.durable_timestamp)  # sanity
+
+        # newer non-durable data file
+        t2 = next(ts_iter)
+        df_non_durable = self._make_diskfile(
+            device, part, *object_parts, timestamp=t2, policy=POLICIES.default,
+            frag_index=frag_index, commit=False, frag_prefs=[])
+        with df_non_durable.open():
+            self.assertNotEqual(df_non_durable.data_timestamp,
+                                df_non_durable.durable_timestamp)  # sanity
+
+        # pretend receiver requested data only
+        send_map = {object_hash: {'data': True}}
+
+        def check_updates(include_non_durable, expected_durable_kwarg):
+            # call updates and check that the call to send_put is as expected
+            self.sender.include_non_durable = include_non_durable
+            self.sender.job = {
+                'device': device,
+                'partition': part,
+                'policy': POLICIES.default,
+                'frag_index': frag_index,
+            }
+            self.sender.node = {}
+            self.sender.send_delete = mock.MagicMock()
+            self.sender.send_put = mock.MagicMock()
+            self.sender.send_post = mock.MagicMock()
+            response = FakeResponse(
+                chunk_body=':UPDATES: START\r\n:UPDATES: END\r\n')
+            connection = FakeConnection()
+
+            self.sender.updates(connection, response, send_map)
+
+            self.assertEqual(self.sender.send_delete.mock_calls, [])
+            self.assertEqual(self.sender.send_post.mock_calls, [])
+            self.assertEqual(1, len(self.sender.send_put.mock_calls))
+            args, kwargs = self.sender.send_put.call_args
+            connection, path, df_non_durable = args
+            self.assertEqual(path, '/a/c/o')
+            self.assertEqual({'durable': expected_durable_kwarg}, kwargs)
+            # note that the put line isn't actually sent since we mock
+            # send_put; send_put is tested separately.
+            self.assertEqual(
+                b''.join(connection.sent),
+                b'11\r\n:UPDATES: START\r\n\r\n'
+                b'f\r\n:UPDATES: END\r\n\r\n')
+
+        # note: we never expect the (False, False) case
+        check_updates(include_non_durable=False, expected_durable_kwarg=True)
+        # non-durable frag is newer so is sent
+        check_updates(include_non_durable=True, expected_durable_kwarg=False)
+        # remove the newer non-durable frag so that the durable frag is sent...
+        df_non_durable.purge(t2, frag_index)
+        check_updates(include_non_durable=True, expected_durable_kwarg=True)
+
+
 class TestModuleMethods(unittest.TestCase):
     def test_encode_missing(self):
         object_hash = '9d41d8cd98f00b204e9800998ecf0abc'
@@ -1618,15 +2020,35 @@ class TestModuleMethods(unittest.TestCase):
             expected.encode('ascii'),
             ssync_sender.encode_missing(object_hash, t_data, t_meta, t_type))
 
+        # optional durable param
+        expected = ('%s %s m:%x,t:%x'
+                    % (object_hash, t_data.internal, d_meta_data, d_type_data))
+        self.assertEqual(
+            expected.encode('ascii'),
+            ssync_sender.encode_missing(object_hash, t_data, t_meta, t_type,
+                                        durable=None))
+        expected = ('%s %s m:%x,t:%x,durable:False'
+                    % (object_hash, t_data.internal, d_meta_data, d_type_data))
+        self.assertEqual(
+            expected.encode('ascii'),
+            ssync_sender.encode_missing(object_hash, t_data, t_meta, t_type,
+                                        durable=False))
+        expected = ('%s %s m:%x,t:%x'
+                    % (object_hash, t_data.internal, d_meta_data, d_type_data))
+        self.assertEqual(
+            expected.encode('ascii'),
+            ssync_sender.encode_missing(object_hash, t_data, t_meta, t_type,
+                                        durable=True))
+
         # test encode and decode functions invert
         expected = {'object_hash': object_hash, 'ts_meta': t_meta,
-                    'ts_data': t_data, 'ts_ctype': t_type}
+                    'ts_data': t_data, 'ts_ctype': t_type, 'durable': False}
         msg = ssync_sender.encode_missing(**expected)
         actual = ssync_receiver.decode_missing(msg)
         self.assertEqual(expected, actual)
 
         expected = {'object_hash': object_hash, 'ts_meta': t_meta,
-                    'ts_data': t_meta, 'ts_ctype': t_meta}
+                    'ts_data': t_meta, 'ts_ctype': t_meta, 'durable': True}
         msg = ssync_sender.encode_missing(**expected)
         actual = ssync_receiver.decode_missing(msg)
         self.assertEqual(expected, actual)

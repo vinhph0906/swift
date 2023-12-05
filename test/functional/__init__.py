@@ -33,6 +33,7 @@ from contextlib import closing
 from gzip import GzipFile
 from shutil import rmtree
 from tempfile import mkdtemp
+from unittest import SkipTest
 
 from six.moves.configparser import ConfigParser, NoSectionError
 from six.moves import http_client
@@ -44,16 +45,16 @@ from swift.common.utils import set_swift_dir
 
 from test import get_config, listen_zero
 
-from test.unit import debug_logger, FakeMemcache
+from test.debug_logger import debug_logger
+from test.unit import FakeMemcache
 # importing skip_if_no_xattrs so that functional tests can grab it from the
-# test.functional namespace. Importing SkipTest so this works under both
-# nose and testr test runners.
+# test.functional namespace.
 from test.unit import skip_if_no_xattrs as real_skip_if_no_xattrs
-from test.unit import SkipTest
 
 from swift.common import constraints, utils, ring, storage_policy
 from swift.common.ring import Ring
-from swift.common.wsgi import loadapp, SwiftHttpProtocol
+from swift.common.http_protocol import SwiftHttpProtocol
+from swift.common.wsgi import loadapp
 from swift.common.utils import config_true_value, split_path
 from swift.account import server as account_server
 from swift.container import server as container_server
@@ -615,16 +616,11 @@ def in_process_setup(the_object_server=object_server):
         'swift_dir': _testdir,
         'mount_check': 'false',
         'client_timeout': '4',
+        'container_update_timeout': '3',
         'allow_account_management': 'true',
         'account_autocreate': 'true',
         'allow_versions': 'True',
         'allow_versioned_writes': 'True',
-        # TODO: move this into s3api config loader because they are
-        #       required by only s3api
-        'allowed_headers':
-            "Content-Disposition, Content-Encoding, X-Delete-At, "
-            "X-Object-Manifest, X-Static-Large-Object, Cache-Control, "
-            "Content-Language, Expires, X-Robots-Tag",
         # Below are values used by the functional test framework, as well as
         # by the various in-process swift servers
         'auth_uri': 'http://127.0.0.1:%d/auth/v1.0/' % prolis.getsockname()[1],
@@ -685,9 +681,6 @@ def in_process_setup(the_object_server=object_server):
                      {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
                       'port': con2lis.getsockname()[1]}], 30),
                     f)
-
-    # Default to only 4 seconds for in-process functional test runs
-    eventlet.wsgi.WRITE_TIMEOUT = 4
 
     def get_logger_name(name):
         if show_debug_logs:

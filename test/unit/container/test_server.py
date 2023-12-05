@@ -44,7 +44,8 @@ from swift.common import constraints
 from swift.common.utils import (Timestamp, mkdirs, public, replication,
                                 storage_directory, lock_parent_directory,
                                 ShardRange, RESERVED_STR)
-from test.unit import fake_http_connect, debug_logger, mock_check_drive
+from test.debug_logger import debug_logger
+from test.unit import fake_http_connect, mock_check_drive
 from swift.common.storage_policy import (POLICIES, StoragePolicy)
 from swift.common.request_helpers import get_sys_meta_prefix, get_reserved_name
 
@@ -238,9 +239,10 @@ class TestContainerController(unittest.TestCase):
         self.assertTrue(created_at_header >= start)
         self.assertEqual(response.headers['x-put-timestamp'],
                          Timestamp(start).normal)
+        time_fmt = "%a, %d %b %Y %H:%M:%S GMT"
         self.assertEqual(
-            response.last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT"),
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(start)))
+            response.last_modified.strftime(time_fmt),
+            time.strftime(time_fmt, time.gmtime(int(start))))
 
         # backend headers
         self.assertEqual(int(response.headers
@@ -2643,7 +2645,8 @@ class TestContainerController(unittest.TestCase):
         # make a container
         ts_iter = make_timestamp_iter()
         ts_now = Timestamp.now()  # used when mocking Timestamp.now()
-        headers = {'X-Timestamp': next(ts_iter).normal}
+        ts_put = next(ts_iter)
+        headers = {'X-Timestamp': ts_put.normal}
         req = Request.blank('/sda1/p/a/c', method='PUT', headers=headers)
         self.assertEqual(201, req.get_response(self.controller).status_int)
         # PUT some objects
@@ -2713,6 +2716,25 @@ class TestContainerController(unittest.TestCase):
             self.assertIn('X-Backend-Record-Type', resp.headers)
             self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
 
+        def check_shard_GET_override_filter(
+                expected_shard_ranges, path, state, params=''):
+            req_headers = {'X-Backend-Record-Type': 'shard',
+                           'X-Backend-Override-Shard-Name-Filter': state}
+            req = Request.blank('/sda1/p/%s?format=json%s' %
+                                (path, params), method='GET',
+                                headers=req_headers)
+            with mock_timestamp_now(ts_now):
+                resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_type, 'application/json')
+            expected = [
+                dict(sr, last_modified=Timestamp(sr.timestamp).isoformat)
+                for sr in expected_shard_ranges]
+            self.assertEqual(expected, json.loads(resp.body))
+            self.assertIn('X-Backend-Record-Type', resp.headers)
+            self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
+            return resp
+
         # all shards
         check_shard_GET(shard_ranges, 'a/c')
         check_shard_GET(reversed(shard_ranges), 'a/c', params='&reverse=true')
@@ -2756,7 +2778,7 @@ class TestContainerController(unittest.TestCase):
 
         # listing shards don't cover entire namespace so expect an extra filler
         extra_shard_range = ShardRange(
-            'a/c', ts_now, shard_ranges[2].upper, ShardRange.MAX, 2, 1024,
+            'a/c', ts_now, shard_ranges[2].upper, ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[:3] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=listing')
@@ -2770,7 +2792,7 @@ class TestContainerController(unittest.TestCase):
             params='&states=listing&reverse=true&end_marker=pickle')
         # updating shards don't cover entire namespace so expect a filler
         extra_shard_range = ShardRange(
-            'a/c', ts_now, shard_ranges[3].upper, ShardRange.MAX, 2, 1024,
+            'a/c', ts_now, shard_ranges[3].upper, ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         expected = shard_ranges[1:4] + [extra_shard_range]
         check_shard_GET(expected, 'a/c', params='&states=updating')
@@ -2779,7 +2801,7 @@ class TestContainerController(unittest.TestCase):
         # when no listing shard ranges cover the requested namespace range then
         # filler is for entire requested namespace
         extra_shard_range = ShardRange(
-            'a/c', ts_now, 'treacle', ShardRange.MAX, 2, 1024,
+            'a/c', ts_now, 'treacle', ShardRange.MAX, 0, 0,
             state=ShardRange.ACTIVE)
         check_shard_GET([extra_shard_range], 'a/c',
                         params='&states=listing&marker=treacle')
@@ -2787,7 +2809,7 @@ class TestContainerController(unittest.TestCase):
             [extra_shard_range], 'a/c',
             params='&states=listing&reverse=true&end_marker=treacle')
         extra_shard_range = ShardRange(
-            'a/c', ts_now, 'treacle', 'walnut', 2, 1024,
+            'a/c', ts_now, 'treacle', 'walnut', 0, 0,
             state=ShardRange.ACTIVE)
         params = '&states=listing&marker=treacle&end_marker=walnut'
         check_shard_GET([extra_shard_range], 'a/c', params=params)
@@ -2862,6 +2884,72 @@ class TestContainerController(unittest.TestCase):
         check_shard_GET([], 'a/c',
                         params='&marker=cheese&end_marker=egg&reverse=true')
 
+        # now vary the sharding state and check the consequences of sending the
+        # x-backend-override-shard-name-filter header:
+        # in unsharded & sharding state the header should be ignored
+        self.assertEqual('unsharded', broker.get_db_state())
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='unsharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertIsNone(
+            resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        ts_epoch = next(ts_iter)
+        broker.enable_sharding(ts_epoch)
+        self.assertTrue(broker.set_sharding_state())
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertIsNone(
+            resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        # in sharded state the server *will* override the marker and reverse
+        # params and return listing shard ranges for entire namespace if
+        # X-Backend-Override-Shard-Name-Filter == 'sharded'
+        self.assertTrue(broker.set_sharded_state())
+        ts_now = next(ts_iter)
+        with mock_timestamp_now(ts_now):
+            extra_shard_range = broker.get_own_shard_range()
+        extra_shard_range.lower = shard_ranges[2].upper
+        extra_shard_range.upper = ShardRange.MAX
+        check_shard_GET(
+            reversed(shard_ranges[:2]), 'a/c',
+            params='&states=listing&reverse=true&marker=egg')
+        expected = shard_ranges[:3] + [extra_shard_range]
+        resp = check_shard_GET_override_filter(
+            reversed(shard_ranges[:2]), 'a/c', state='sharding',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = check_shard_GET_override_filter(
+            expected, 'a/c', state='sharded',
+            params='&states=listing&reverse=true&marker=egg')
+        self.assertEqual(
+            'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+        # updating state excludes the first shard which has 'shrinking' state
+        # but includes the fourth which has 'created' state
+        extra_shard_range.lower = shard_ranges[3].upper
+        check_shard_GET(
+            shard_ranges[1:2], 'a/c',
+            params='&states=updating&includes=egg')
+        expected = shard_ranges[1:4] + [extra_shard_range]
+        resp = check_shard_GET_override_filter(
+            expected, 'a/c', state='sharded',
+            params='&states=updating&includes=egg')
+        self.assertEqual(
+            'true', resp.headers.get('X-Backend-Override-Shard-Name-Filter'))
+
         # delete a shard range
         shard_range = shard_ranges[1]
         shard_range.set_deleted(timestamp=next(ts_iter))
@@ -2886,10 +2974,105 @@ class TestContainerController(unittest.TestCase):
         self.assertFalse(self.controller.logger.get_lines_for_level('warning'))
         self.assertFalse(self.controller.logger.get_lines_for_level('error'))
 
+    def test_GET_shard_ranges_from_compacted_shard(self):
+        # make a shrunk shard container with two acceptors that overlap with
+        # the shard's namespace
+        shard_path = '.shards_a/c_f'
+        ts_iter = make_timestamp_iter()
+        ts_now = Timestamp.now()  # used when mocking Timestamp.now()
+        own_shard_range = ShardRange(shard_path, next(ts_iter),
+                                     'b', 'f', 100, 1000,
+                                     meta_timestamp=next(ts_iter),
+                                     state=ShardRange.SHRUNK,
+                                     state_timestamp=next(ts_iter),
+                                     epoch=next(ts_iter))
+        shard_ranges = []
+        for lower, upper in (('a', 'd'), ('d', 'g')):
+            shard_ranges.append(
+                ShardRange('.shards_a/c_%s' % upper, next(ts_iter),
+                           lower, upper, 100, 1000,
+                           meta_timestamp=next(ts_iter),
+                           state=ShardRange.ACTIVE,
+                           state_timestamp=next(ts_iter)))
+
+        # create container
+        headers = {'X-Timestamp': next(ts_iter).normal}
+        req = Request.blank(
+            '/sda1/p/%s' % shard_path, method='PUT', headers=headers)
+        self.assertIn(
+            req.get_response(self.controller).status_int, (201, 202))
+
+        # PUT the acceptor shard ranges and own shard range
+        headers = {'X-Timestamp': next(ts_iter).normal,
+                   'X-Container-Sysmeta-Shard-Root': 'a/c',
+                   'X-Backend-Record-Type': 'shard'}
+        body = json.dumps(
+            [dict(sr) for sr in shard_ranges + [own_shard_range]])
+        req = Request.blank('/sda1/p/%s' % shard_path, method='PUT',
+                            headers=headers, body=body)
+        self.assertEqual(202, req.get_response(self.controller).status_int)
+
+        def do_get(params, extra_headers, expected):
+            expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                        for sr in expected]
+            headers = {'X-Backend-Record-Type': 'shard'}
+            headers.update(extra_headers)
+            req = Request.blank('/sda1/p/%s?format=json%s' %
+                                (shard_path, params), method='GET',
+                                headers=headers)
+            with mock_timestamp_now(ts_now):
+                resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_type, 'application/json')
+            self.assertEqual(expected, json.loads(resp.body))
+            self.assertIn('X-Backend-Record-Type', resp.headers)
+            self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
+            return resp
+
+        # unsharded shard container...
+        do_get('', {}, shard_ranges)
+        do_get('&marker=e', {}, shard_ranges[1:])
+        do_get('&end_marker=d', {}, shard_ranges[:1])
+        do_get('&end_marker=k', {}, shard_ranges)
+        do_get('&marker=b&end_marker=f&states=listing', {}, shard_ranges)
+        do_get('&marker=b&end_marker=c&states=listing', {}, shard_ranges[:1])
+        do_get('&marker=b&end_marker=z&states=listing', {}, shard_ranges)
+        do_get('&states=listing', {}, shard_ranges)
+
+        # send X-Backend-Override-Shard-Name-Filter, but db is not yet sharded
+        # so this has no effect
+        extra_headers = {'X-Backend-Override-Shard-Name-Filter': 'sharded'}
+        resp = do_get('', extra_headers, shard_ranges)
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = do_get('&marker=e', extra_headers, shard_ranges[1:])
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = do_get('&end_marker=d', extra_headers, shard_ranges[:1])
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        resp = do_get('&states=listing', {}, shard_ranges)
+        self.assertNotIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+
+        # set broker to sharded state so X-Backend-Override-Shard-Name-Filter
+        # does have effect
+        shard_broker = self.controller._get_container_broker(
+            'sda1', 'p', '.shards_a', 'c_f')
+        self.assertTrue(shard_broker.set_sharding_state())
+        self.assertTrue(shard_broker.set_sharded_state())
+
+        resp = do_get('', extra_headers, shard_ranges)
+        self.assertIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        self.assertTrue(resp.headers['X-Backend-Override-Shard-Name-Filter'])
+
+        resp = do_get('&marker=e', extra_headers, shard_ranges)
+        self.assertIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        self.assertTrue(resp.headers['X-Backend-Override-Shard-Name-Filter'])
+
+        resp = do_get('&end_marker=d', extra_headers, shard_ranges)
+        self.assertIn('X-Backend-Override-Shard-Name-Filter', resp.headers)
+        self.assertTrue(resp.headers['X-Backend-Override-Shard-Name-Filter'])
+
     def test_GET_shard_ranges_using_state_aliases(self):
         # make a shard container
         ts_iter = make_timestamp_iter()
-        ts_now = Timestamp.now()  # used when mocking Timestamp.now()
         shard_ranges = []
         lower = ''
         for state in sorted(ShardRange.STATES.keys()):
@@ -2906,8 +3089,7 @@ class TestContainerController(unittest.TestCase):
                 sr for sr in shard_ranges if sr.state in expected_states]
             own_shard_range = ShardRange(path, next(ts_iter), '', '',
                                          state=ShardRange.ACTIVE)
-            expected.append(own_shard_range.copy(
-                lower=expected[-1].upper, meta_timestamp=ts_now))
+            expected.append(own_shard_range.copy(lower=expected[-1].upper))
             expected = [dict(sr, last_modified=sr.timestamp.isoformat)
                         for sr in expected]
             headers = {'X-Timestamp': next(ts_iter).normal}
@@ -2930,8 +3112,7 @@ class TestContainerController(unittest.TestCase):
             req = Request.blank('/sda1/p/%s?format=json%s' %
                                 (path, params), method='GET',
                                 headers={'X-Backend-Record-Type': 'shard'})
-            with mock_timestamp_now(ts_now):
-                resp = req.get_response(self.controller)
+            resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.content_type, 'application/json')
             self.assertEqual(expected, json.loads(resp.body))
@@ -3092,6 +3273,98 @@ class TestContainerController(unittest.TestCase):
 
         do_test({'states': 'bad'}, 404)
 
+    def test_GET_shard_ranges_auditing(self):
+        # verify that states=auditing causes own shard range to be included
+        def put_shard_ranges(shard_ranges):
+            headers = {'X-Timestamp': next(self.ts).normal,
+                       'X-Backend-Record-Type': 'shard'}
+            body = json.dumps([dict(sr) for sr in shard_ranges])
+            req = Request.blank(
+                '/sda1/p/a/c', method='PUT', headers=headers, body=body)
+            self.assertEqual(202, req.get_response(self.controller).status_int)
+
+        def do_test(ts_now, extra_params):
+            headers = {'X-Backend-Record-Type': 'shard',
+                       'X-Backend-Include-Deleted': 'True'}
+            params = {'format': 'json'}
+            if extra_params:
+                params.update(extra_params)
+            req = Request.blank('/sda1/p/a/c?format=json', method='GET',
+                                headers=headers, params=params)
+            with mock_timestamp_now(ts_now):
+                resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.content_type, 'application/json')
+            self.assertIn('X-Backend-Record-Type', resp.headers)
+            self.assertEqual('shard', resp.headers['X-Backend-Record-Type'])
+            return resp
+
+        # initially not all shards are shrinking and root is sharded
+        own_sr = ShardRange('a/c', next(self.ts), '', '',
+                            state=ShardRange.SHARDED)
+        shard_bounds = [('', 'f', ShardRange.SHRUNK, True),
+                        ('f', 't', ShardRange.SHRINKING, False),
+                        ('t', '', ShardRange.ACTIVE, False)]
+        shard_ranges = [
+            ShardRange('.shards_a/_%s' % upper, next(self.ts),
+                       lower, upper, state=state, deleted=deleted)
+            for (lower, upper, state, deleted) in shard_bounds]
+        overlap = ShardRange('.shards_a/c_bad', next(self.ts), '', 'f',
+                             state=ShardRange.FOUND)
+
+        # create container and PUT some shard ranges
+        headers = {'X-Timestamp': next(self.ts).normal}
+        req = Request.blank(
+            '/sda1/p/a/c', method='PUT', headers=headers)
+        self.assertIn(
+            req.get_response(self.controller).status_int, (201, 202))
+        put_shard_ranges(shard_ranges + [own_sr, overlap])
+
+        # do *not* expect own shard range in default case (no states param)
+        ts_now = next(self.ts)
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in [overlap] + shard_ranges]
+        resp = do_test(ts_now, {})
+        self.assertEqual(expected, json.loads(resp.body))
+
+        # expect own shard range to be included when states=auditing
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges + [own_sr]]
+        resp = do_test(ts_now, {'states': 'auditing'})
+        self.assertEqual(expected, json.loads(resp.body))
+
+        # expect own shard range to be included, marker/end_marker respected
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges[1:2] + [own_sr]]
+        resp = do_test(ts_now, {'marker': 'f', 'end_marker': 't',
+                                'states': 'auditing'})
+        self.assertEqual(expected, json.loads(resp.body))
+
+        # update shards to all shrinking and root to active
+        shard_ranges[-1].update_state(ShardRange.SHRINKING, next(self.ts))
+        own_sr.update_state(ShardRange.ACTIVE, next(self.ts))
+        put_shard_ranges(shard_ranges + [own_sr])
+
+        # do *not* expect own shard range in default case (no states param)
+        ts_now = next(self.ts)
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in [overlap] + shard_ranges]
+        resp = do_test(ts_now, {})
+        self.assertEqual(expected, json.loads(resp.body))
+
+        # expect own shard range to be included when states=auditing
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges[:2] + [own_sr] + shard_ranges[2:]]
+        resp = do_test(ts_now, {'states': 'auditing'})
+        self.assertEqual(expected, json.loads(resp.body))
+
+        # expect own shard range to be included, marker/end_marker respected
+        expected = [dict(sr, last_modified=sr.timestamp.isoformat)
+                    for sr in shard_ranges[1:2] + [own_sr]]
+        resp = do_test(ts_now, {'marker': 'f', 'end_marker': 't',
+                                'states': 'auditing'})
+        self.assertEqual(expected, json.loads(resp.body))
+
     def test_GET_auto_record_type(self):
         # make a container
         ts_iter = make_timestamp_iter()
@@ -3139,6 +3412,12 @@ class TestContainerController(unittest.TestCase):
             self.assertIn('X-Backend-Record-Type', resp.headers)
             self.assertEqual(
                 'object', resp.headers.pop('X-Backend-Record-Type'))
+            self.assertEqual(
+                str(POLICIES.default.idx),
+                resp.headers.pop('X-Backend-Storage-Policy-Index'))
+            self.assertEqual(
+                str(POLICIES.default.idx),
+                resp.headers.pop('X-Backend-Record-Storage-Policy-Index'))
             resp.headers.pop('Content-Length')
             return resp
 
@@ -3154,6 +3433,11 @@ class TestContainerController(unittest.TestCase):
             self.assertIn('X-Backend-Record-Type', resp.headers)
             self.assertEqual(
                 'shard', resp.headers.pop('X-Backend-Record-Type'))
+            self.assertEqual(
+                str(POLICIES.default.idx),
+                resp.headers.pop('X-Backend-Storage-Policy-Index'))
+            self.assertNotIn('X-Backend-Record-Storage-Policy-Index',
+                             resp.headers)
             resp.headers.pop('Content-Length')
             return resp
 
@@ -3962,6 +4246,119 @@ class TestContainerController(unittest.TestCase):
         req.accept = 'application/xml*'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 406)
+
+    @patch_policies([
+        StoragePolicy(0, name='nulo', is_default=True),
+        StoragePolicy(1, name='unu'),
+        StoragePolicy(2, name='du'),
+    ])
+    def test_GET_objects_of_different_policies(self):
+        # make a container
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'PUT',
+                                    'HTTP_X_TIMESTAMP': '0'})
+        resp = req.get_response(self.controller)
+        resp_policy_idx = resp.headers['X-Backend-Storage-Policy-Index']
+        self.assertEqual(resp_policy_idx, str(POLICIES.default.idx))
+
+        pol_def_objs = ['obj_default_%d' % i for i in range(11)]
+        pol_1_objs = ['obj_1_%d' % i for i in range(10)]
+
+        # fill the container
+        for obj in pol_def_objs:
+            req = Request.blank(
+                '/sda1/p/a/c/%s' % obj,
+                environ={
+                    'REQUEST_METHOD': 'PUT',
+                    'HTTP_X_TIMESTAMP': '1',
+                    'HTTP_X_CONTENT_TYPE': 'text/plain',
+                    'HTTP_X_ETAG': 'x',
+                    'HTTP_X_SIZE': 0})
+            self._update_object_put_headers(req)
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 201)
+
+        for obj in pol_1_objs:
+            req = Request.blank(
+                '/sda1/p/a/c/%s' % obj,
+                environ={
+                    'REQUEST_METHOD': 'PUT',
+                    'HTTP_X_TIMESTAMP': '1',
+                    'HTTP_X_CONTENT_TYPE': 'text/plain',
+                    'HTTP_X_ETAG': 'x',
+                    'HTTP_X_SIZE': 0,
+                    'HTTP_X_BACKEND_STORAGE_POLICY_INDEX': 1})
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 201)
+
+        expected_pol_def_objs = [o.encode('utf8') for o in pol_def_objs]
+        expected_pol_1_objs = [o.encode('utf8') for o in pol_1_objs]
+
+        # By default the container server will return objects belonging to
+        # the brokers storage policy
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        result = [o for o in resp.body.split(b'\n') if o]
+        self.assertEqual(len(result), 11)
+        self.assertEqual(sorted(result), sorted(expected_pol_def_objs))
+        self.assertIn('X-Backend-Storage-Policy-Index', resp.headers)
+        self.assertEqual('0', resp.headers['X-Backend-Storage-Policy-Index'])
+        self.assertEqual('0',
+                         resp.headers['X-Backend-Record-Storage-Policy-Index'])
+
+        # If we specify the policy 0 idx we should get the same
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
+        req.headers['X-Backend-Storage-Policy-Index'] = POLICIES.default.idx
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        result = [o for o in resp.body.split(b'\n') if o]
+        self.assertEqual(len(result), 11)
+        self.assertEqual(sorted(result), sorted(expected_pol_def_objs))
+        self.assertIn('X-Backend-Storage-Policy-Index', resp.headers)
+        self.assertEqual('0', resp.headers['X-Backend-Storage-Policy-Index'])
+        self.assertEqual('0',
+                         resp.headers['X-Backend-Record-Storage-Policy-Index'])
+
+        # And if we specify a different idx we'll get objects for that policy
+        # and the X-Backend-Record-Storage-Policy-Index letting us know the
+        # policy for which these objects came from, if it differs from the
+        # policy stored in the DB.
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
+        req.headers['X-Backend-Storage-Policy-Index'] = 1
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        result = [o for o in resp.body.split(b'\n') if o]
+        self.assertEqual(len(result), 10)
+        self.assertEqual(sorted(result), sorted(expected_pol_1_objs))
+        self.assertIn('X-Backend-Storage-Policy-Index', resp.headers)
+        self.assertEqual('0', resp.headers['X-Backend-Storage-Policy-Index'])
+        self.assertEqual('1',
+                         resp.headers['X-Backend-Record-Storage-Policy-Index'])
+
+        # And an index that the broker doesn't have any objects for
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
+        req.headers['X-Backend-Storage-Policy-Index'] = 2
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 204)
+        result = [o for o in resp.body.split(b'\n') if o]
+        self.assertEqual(len(result), 0)
+        self.assertFalse(result)
+        self.assertIn('X-Backend-Storage-Policy-Index', resp.headers)
+        self.assertEqual('0', resp.headers['X-Backend-Storage-Policy-Index'])
+        self.assertEqual('2',
+                         resp.headers['X-Backend-Record-Storage-Policy-Index'])
+
+        # And an index that doesn't exist in POLICIES
+        req = Request.blank(
+            '/sda1/p/a/c', environ={'REQUEST_METHOD': 'GET'})
+        req.headers['X-Backend-Storage-Policy-Index'] = 3
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 400)
 
     def test_GET_limit(self):
         # make a container
@@ -4819,7 +5216,7 @@ class TestContainerController(unittest.TestCase):
         # Test replication_server flag was set from configuration file.
         container_controller = container_server.ContainerController
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertIsNone(container_controller(conf).replication_server)
+        self.assertTrue(container_controller(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(container_controller(conf).replication_server)
@@ -4917,7 +5314,7 @@ class TestContainerController(unittest.TestCase):
             self.assertEqual(response, answer)
             self.assertEqual(outbuf.getvalue()[:4], '405 ')
 
-    def test_call_incorrect_replication_method(self):
+    def test_replication_server_call_all_methods(self):
         inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
@@ -4929,7 +5326,7 @@ class TestContainerController(unittest.TestCase):
             """Sends args to outbuf"""
             outbuf.writelines(status)
 
-        obj_methods = ['DELETE', 'PUT', 'HEAD', 'GET', 'POST', 'OPTIONS']
+        obj_methods = ['PUT', 'HEAD', 'GET', 'POST', 'DELETE', 'OPTIONS']
         for method in obj_methods:
             env = {'REQUEST_METHOD': method,
                    'SCRIPT_NAME': '',
@@ -4937,6 +5334,7 @@ class TestContainerController(unittest.TestCase):
                    'SERVER_NAME': '127.0.0.1',
                    'SERVER_PORT': '8080',
                    'SERVER_PROTOCOL': 'HTTP/1.0',
+                   'HTTP_X_TIMESTAMP': next(self.ts).internal,
                    'CONTENT_LENGTH': '0',
                    'wsgi.version': (1, 0),
                    'wsgi.url_scheme': 'http',
@@ -4947,7 +5345,7 @@ class TestContainerController(unittest.TestCase):
                    'wsgi.run_once': False}
             self.controller(env, start_response)
             self.assertEqual(errbuf.getvalue(), '')
-            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+            self.assertIn(outbuf.getvalue()[:4], ('200 ', '201 ', '204 '))
 
     def test__call__raise_timeout(self):
         inbuf = WsgiBytesIO()

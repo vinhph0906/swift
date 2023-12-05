@@ -29,8 +29,9 @@ from swift.obj import server as object_server
 from swift.proxy import server as proxy
 import swift.proxy.controllers
 from swift.proxy.controllers.base import get_object_info
-from test.unit import FakeMemcache, debug_logger, FakeRing, \
-    fake_http_connect, patch_policies, skip_if_no_xattrs
+from test.debug_logger import debug_logger
+from test.unit import FakeMemcache, FakeRing, fake_http_connect, \
+    patch_policies, skip_if_no_xattrs
 
 
 class FakeServerConnection(WSGIContext):
@@ -132,7 +133,7 @@ class TestObjectSysmeta(unittest.TestCase):
 
     def setUp(self):
         skip_if_no_xattrs()
-        self.app = proxy.Application(None, FakeMemcache(),
+        self.app = proxy.Application(None,
                                      logger=debug_logger('proxy-ut'),
                                      account_ring=FakeRing(replicas=1),
                                      container_ring=FakeRing(replicas=1))
@@ -227,8 +228,9 @@ class TestObjectSysmeta(unittest.TestCase):
 
     def test_sysmeta_replaced_by_PUT(self):
         path = '/v1/a/c/o'
+        cache = FakeMemcache()
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)
@@ -237,7 +239,7 @@ class TestObjectSysmeta(unittest.TestCase):
         resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.changed_sysmeta_headers)
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.changed_meta_headers)
@@ -247,7 +249,7 @@ class TestObjectSysmeta(unittest.TestCase):
         resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
-        req = Request.blank(path, environ={})
+        req = Request.blank(path, environ={'swift.cache': cache})
         resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
@@ -257,29 +259,30 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertNotInHeaders(resp, self.original_meta_headers_2)
 
-    def _test_sysmeta_not_updated_by_POST(self, app):
+    def test_sysmeta_not_updated_by_POST(self):
         # check sysmeta is not changed by a POST but user meta is replaced
         path = '/v1/a/c/o'
+        cache = FakeMemcache()
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_meta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs, body=b'x')
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
-        env = {'REQUEST_METHOD': 'POST'}
+        env = {'REQUEST_METHOD': 'POST', 'swift.cache': cache}
         hdrs = dict(self.changed_sysmeta_headers)
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.changed_meta_headers)
         hdrs.update(self.new_meta_headers)
         hdrs.update(self.bad_headers)
         req = Request.blank(path, environ=env, headers=hdrs)
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 202)
 
-        req = Request.blank(path, environ={})
-        resp = req.get_response(app)
+        req = Request.blank(path, environ={'swift.cache': cache})
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_sysmeta_headers_1)
         self._assertNotInHeaders(resp, self.new_sysmeta_headers)
@@ -287,31 +290,28 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.new_meta_headers)
         self._assertNotInHeaders(resp, self.bad_headers)
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.changed_sysmeta_headers)
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.bad_headers)
         req = Request.blank(path, environ=env, headers=hdrs, body=b'x')
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
-        req = Request.blank(path, environ={})
-        resp = req.get_response(app)
+        req = Request.blank(path, environ={'swift.cache': cache})
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
         self._assertInHeaders(resp, self.new_sysmeta_headers)
         self._assertNotInHeaders(resp, self.original_sysmeta_headers_2)
-
-    def test_sysmeta_not_updated_by_POST(self):
-        # test fast-post by issuing requests to the proxy app
-        self._test_sysmeta_not_updated_by_POST(self.app)
 
     def test_sysmeta_updated_by_COPY(self):
         # check sysmeta is updated by a COPY in same way as user meta by
         # issuing requests to the copy middleware app
         path = '/v1/a/c/o'
         dest = '/c/o2'
-        env = {'REQUEST_METHOD': 'PUT'}
+        cache = FakeMemcache()
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)
@@ -322,7 +322,7 @@ class TestObjectSysmeta(unittest.TestCase):
         resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
 
-        env = {'REQUEST_METHOD': 'COPY'}
+        env = {'REQUEST_METHOD': 'COPY', 'swift.cache': cache}
         hdrs = dict(self.changed_sysmeta_headers)
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.changed_meta_headers)
@@ -345,7 +345,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.original_transient_sysmeta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
 
-        req = Request.blank('/v1/a/c/o2', environ={})
+        req = Request.blank('/v1/a/c/o2', environ={'swift.cache': cache})
         resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
@@ -363,7 +363,8 @@ class TestObjectSysmeta(unittest.TestCase):
         # check sysmeta is updated by a PUT with x-copy-from in same way as
         # user meta by issuing requests to the copy middleware app
         path = '/v1/a/c/o'
-        env = {'REQUEST_METHOD': 'PUT'}
+        cache = FakeMemcache()
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)
@@ -372,7 +373,7 @@ class TestObjectSysmeta(unittest.TestCase):
         resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 201)
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.changed_sysmeta_headers)
         hdrs.update(self.new_sysmeta_headers)
         hdrs.update(self.changed_meta_headers)
@@ -390,7 +391,7 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.original_meta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
 
-        req = Request.blank('/v1/a/c/o2', environ={})
+        req = Request.blank('/v1/a/c/o2', environ={'swift.cache': cache})
         resp = req.get_response(self.copy_app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_sysmeta_headers)
@@ -401,40 +402,41 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertInHeaders(resp, self.original_meta_headers_2)
         self._assertNotInHeaders(resp, self.bad_headers)
 
-    def _test_transient_sysmeta_replaced_by_PUT_or_POST(self, app):
+    def test_transient_sysmeta_replaced_by_PUT_or_POST(self):
         # check transient_sysmeta is replaced en-masse by a POST
         path = '/v1/a/c/o'
+        cache = FakeMemcache()
 
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.original_transient_sysmeta_headers_1)
         hdrs.update(self.original_transient_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs, body=b'x')
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
         req = Request.blank(path, environ={})
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_transient_sysmeta_headers_1)
         self._assertInHeaders(resp, self.original_transient_sysmeta_headers_2)
         self._assertInHeaders(resp, self.original_meta_headers_1)
 
-        info = get_object_info(req.environ, app)
+        info = get_object_info(req.environ, self.app)
         self.assertEqual(2, len(info.get('transient_sysmeta', ())))
         self.assertEqual({'testa': 'A', 'testb': 'B'},
                          info['transient_sysmeta'])
 
         # POST will replace all existing transient_sysmeta and usermeta values
-        env = {'REQUEST_METHOD': 'POST'}
+        env = {'REQUEST_METHOD': 'POST', 'swift.cache': cache}
         hdrs = dict(self.changed_transient_sysmeta_headers)
         hdrs.update(self.new_transient_sysmeta_headers_1)
         req = Request.blank(path, environ=env, headers=hdrs)
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 202)
 
         req = Request.blank(path, environ={})
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.changed_transient_sysmeta_headers)
         self._assertInHeaders(resp, self.new_transient_sysmeta_headers_1)
@@ -442,21 +444,21 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertNotInHeaders(resp,
                                  self.original_transient_sysmeta_headers_2)
 
-        info = get_object_info(req.environ, app)
+        info = get_object_info(req.environ, self.app)
         self.assertEqual(2, len(info.get('transient_sysmeta', ())))
         self.assertEqual({'testa': 'changed_A', 'testc': 'C'},
                          info['transient_sysmeta'])
 
         # subsequent PUT replaces all transient_sysmeta and usermeta values
-        env = {'REQUEST_METHOD': 'PUT'}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
         hdrs = dict(self.new_transient_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_2)
         req = Request.blank(path, environ=env, headers=hdrs, body=b'x')
-        resp = req.get_response(app)
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 201)
 
-        req = Request.blank(path, environ={})
-        resp = req.get_response(app)
+        req = Request.blank(path, environ={'swift.cache': cache})
+        resp = req.get_response(self.app)
         self._assertStatus(resp, 200)
         self._assertInHeaders(resp, self.original_meta_headers_2)
         self._assertInHeaders(resp, self.new_transient_sysmeta_headers_2)
@@ -470,9 +472,6 @@ class TestObjectSysmeta(unittest.TestCase):
         self._assertNotInHeaders(resp,
                                  self.original_transient_sysmeta_headers_2)
 
-        info = get_object_info(req.environ, app)
+        info = get_object_info(req.environ, self.app)
         self.assertEqual(1, len(info.get('transient_sysmeta', ())))
         self.assertEqual({'testd': 'D'}, info['transient_sysmeta'])
-
-    def test_transient_sysmeta_replaced_by_PUT_or_POST(self):
-        self._test_transient_sysmeta_replaced_by_PUT_or_POST(self.app)

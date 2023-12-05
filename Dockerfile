@@ -1,10 +1,10 @@
 ################################################
 #
-#  Alpine 3.10.1 Swift-All-In-One
+#  Alpine 3.15.6 Swift-All-In-One
 #
 ################################################
 
-FROM        alpine:3.10.1
+FROM        alpine:3.15.6
 MAINTAINER  Openstack Swift
 
 ENV	        S6_LOGGING 1
@@ -46,7 +46,7 @@ RUN         mkdir /etc/swift && \
             echo && \
             echo && \
             echo "================   installing s6-overlay  ===================" && \
-            curl https://keybase.io/justcontainers/key.asc | gpg --import && \
+            gpg --import /opt/swift/docker/s6-gpg-pub-key && \
             gpg --verify /tmp/s6-overlay-$ARCH.tar.gz.sig /tmp/s6-overlay-$ARCH.tar.gz && \
             gunzip -c /tmp/s6-overlay-$ARCH.tar.gz | tar -xf - -C / && \
             gunzip -c /tmp/socklog-overlay-amd64.tar.gz | tar -xf - -C / && \

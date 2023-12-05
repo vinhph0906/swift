@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
+import functools
 import io
 import json
 import os
@@ -33,7 +33,7 @@ from swiftclient import get_auth
 from swift.common import constraints
 from swift.common.http import is_success
 from swift.common.swob import str_to_wsgi, wsgi_to_str
-from swift.common.utils import config_true_value
+from swift.common.utils import config_true_value, md5
 
 from test import safe_repr
 
@@ -672,29 +672,34 @@ class Container(Base):
         raise ResponseError(self.conn.response, 'POST',
                             self.conn.make_path(self.path))
 
-    def delete(self, hdrs=None, parms=None):
+    def delete(self, hdrs=None, parms=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if parms is None:
             parms = {}
+        allowed_codes = (204, 404) if tolerate_missing else (204, )
         return self.conn.make_request('DELETE', self.path, hdrs=hdrs,
-                                      parms=parms) == 204
+                                      parms=parms) in allowed_codes
 
-    def delete_files(self):
-        for f in listing_items(self.files):
+    def delete_files(self, tolerate_missing=False):
+        partialed_files = functools.partial(
+            self.files, tolerate_missing=tolerate_missing)
+
+        for f in listing_items(partialed_files):
             file_item = self.file(f)
             if not file_item.delete(tolerate_missing=True):
                 return False
 
-        return listing_empty(self.files)
+        return listing_empty(partialed_files)
 
     def delete_recursive(self):
-        return self.delete_files() and self.delete()
+        return self.delete_files(tolerate_missing=True) and \
+            self.delete(tolerate_missing=True)
 
     def file(self, file_name):
         return File(self.conn, self.account, self.name, file_name)
 
-    def files(self, hdrs=None, parms=None, cfg=None):
+    def files(self, hdrs=None, parms=None, cfg=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if parms is None:
@@ -762,7 +767,7 @@ class Container(Base):
                     return [line.decode('utf-8') for line in lines]
                 else:
                     return []
-        elif status == 204:
+        elif status == 204 or (status == 404 and tolerate_missing):
             return []
 
         raise ResponseError(self.conn.response, 'GET',
@@ -851,7 +856,7 @@ class File(Base):
         if isinstance(data, bytes):
             data = io.BytesIO(data)
 
-        checksum = hashlib.md5()
+        checksum = md5(usedforsecurity=False)
         buff = data.read(block_size)
         while buff:
             checksum.update(buff)
@@ -1058,7 +1063,7 @@ class File(Base):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
-        checksum = hashlib.md5()
+        checksum = md5(usedforsecurity=False)
 
         scratch = self.conn.response.read(8192)
         while len(scratch) > 0:

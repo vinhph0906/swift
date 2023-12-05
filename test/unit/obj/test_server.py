@@ -31,7 +31,6 @@ import random
 from shutil import rmtree
 from time import gmtime, strftime, time, struct_time
 from tempfile import mkdtemp
-from hashlib import md5
 from collections import defaultdict
 from contextlib import contextmanager
 from textwrap import dedent
@@ -41,8 +40,9 @@ from eventlet.green import httplib
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
-from test import listen_zero
-from test.unit import FakeLogger, debug_logger, mocked_http_conn, \
+from test import listen_zero, BaseTestCase
+from test.debug_logger import debug_logger
+from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
     mock_check_drive
@@ -53,7 +53,7 @@ from swift.common import utils, bufferedhttp
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     NullLogger, storage_directory, public, replication, encode_timestamps, \
-    Timestamp
+    Timestamp, md5
 from swift.common import constraints
 from swift.common.request_helpers import get_reserved_name
 from swift.common.swob import Request, WsgiBytesIO
@@ -134,7 +134,7 @@ class TestTpoolSize(unittest.TestCase):
 
 
 @patch_policies(test_policies)
-class TestObjectController(unittest.TestCase):
+class TestObjectController(BaseTestCase):
     """Test swift.obj.server.ObjectController"""
 
     def setUp(self):
@@ -148,7 +148,7 @@ class TestObjectController(unittest.TestCase):
         mkdirs(os.path.join(self.testdir, 'sda1'))
         self.conf = {'devices': self.testdir, 'mount_check': 'false',
                      'container_update_timeout': 0.0}
-        self.logger = debug_logger()
+        self.logger = debug_logger('test-object-controller')
         self.object_controller = object_server.ObjectController(
             self.conf, logger=self.logger)
         self.object_controller.bytes_per_sync = 1
@@ -157,7 +157,6 @@ class TestObjectController(unittest.TestCase):
         self.df_mgr = diskfile.DiskFileManager(self.conf,
                                                self.object_controller.logger)
 
-        self.logger = debug_logger('test-object-controller')
         self.ts = make_timestamp_iter()
         self.ec_policies = [p for p in POLICIES if p.policy_type == EC_POLICY]
 
@@ -261,7 +260,7 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers=headers)
         req.body = b'VERIFY'
-        etag = '"%s"' % md5(b'VERIFY').hexdigest()
+        etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(dict(resp.headers), {
@@ -1189,6 +1188,8 @@ class TestObjectController(unittest.TestCase):
                     {'devices': self.testdir,
                      'mount_check': 'false'}, logger=debug_logger())
                 node = {'id': 1, 'ip': 'chost', 'port': 3200,
+                        'replication_ip': 'chost_repl',
+                        'replication_port': 6200,
                         'device': 'cdevice'}
                 mock_ring = mock.MagicMock()
                 mock_ring.get_nodes.return_value = (99, [node])
@@ -1198,6 +1199,8 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(1, len(conn.requests))
         self.assertEqual('/cdevice/99/.sharded_a/c_shard_1/o',
                          conn.requests[0]['path'])
+        self.assertEqual(6200, conn.requests[0]['port'])
+        self.assertEqual('chost_repl', conn.requests[0]['ip'])
 
     def test_PUT_redirected_async_pending(self):
         self._check_PUT_redirected_async_pending()
@@ -1725,9 +1728,10 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        obj_etag = md5(b"obj data").hexdigest()
+        obj_etag = md5(b"obj data", usedforsecurity=False).hexdigest()
         footer_meta = json.dumps({"Etag": obj_etag}).encode('ascii')
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -1773,11 +1777,12 @@ class TestObjectController(unittest.TestCase):
             '/sda1/p/a/c/o', headers=headers,
             environ={'REQUEST_METHOD': 'PUT'})
 
-        obj_etag = md5(b"obj data").hexdigest()
+        obj_etag = md5(b"obj data", usedforsecurity=False).hexdigest()
         footers = {'Etag': obj_etag}
         footers.update(override_footers)
         footer_meta = json.dumps(footers).encode('ascii')
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -1863,9 +1868,10 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footers = {"Etag": md5(b"green").hexdigest()}
+        footers = {"Etag": md5(b"green", usedforsecurity=False).hexdigest()}
         footer_meta = json.dumps(footers).encode('ascii')
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -1899,7 +1905,8 @@ class TestObjectController(unittest.TestCase):
             'X-Object-Meta-X': 'Y',
             'X-Object-Sysmeta-X': 'Y',
         }).encode('ascii')
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -1937,7 +1944,7 @@ class TestObjectController(unittest.TestCase):
             environ={'REQUEST_METHOD': 'PUT'})
 
         footer_meta = json.dumps({
-            "Etag": md5(b"obj data").hexdigest()
+            "Etag": md5(b"obj data", usedforsecurity=False).hexdigest()
         }).encode('ascii')
 
         req.body = b"\r\n".join((
@@ -1967,10 +1974,11 @@ class TestObjectController(unittest.TestCase):
             environ={'REQUEST_METHOD': 'PUT'})
 
         footer_meta = json.dumps({
-            "Etag": md5(b"obj data").hexdigest()
+            "Etag": md5(b"obj data", usedforsecurity=False).hexdigest()
         }).encode('ascii')
         bad_footer_meta_cksum = \
-            md5(footer_meta + b"bad").hexdigest().encode('ascii')
+            md5(footer_meta + b"bad",
+                usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -1999,7 +2007,8 @@ class TestObjectController(unittest.TestCase):
             environ={'REQUEST_METHOD': 'PUT'})
 
         footer_meta = b"{{{[[{{[{[[{[{[[{{{[{{{{[[{{[{["
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -2030,7 +2039,8 @@ class TestObjectController(unittest.TestCase):
         footer_meta = json.dumps({
             'X-Object-Meta-Mint': 'pepper'
         }).encode('ascii')
-        footer_meta_cksum = md5(footer_meta).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
         req.body = b"\r\n".join((
             b"--boundary",
@@ -2623,14 +2633,15 @@ class TestObjectController(unittest.TestCase):
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
-    def test_EC_GET_PUT_data(self):
+    def test_EC_PUT_GET_data(self):
         for policy in self.ec_policies:
+            ts = next(self.ts)
             raw_data = (b'VERIFY' * policy.ec_segment_size)[:-432]
             frag_archives = encode_frag_archive_bodies(policy, raw_data)
             frag_index = random.randint(0, len(frag_archives) - 1)
             # put EC frag archive
             req = Request.blank('/sda1/p/a/c/o', method='PUT', headers={
-                'X-Timestamp': next(self.ts).internal,
+                'X-Timestamp': ts.internal,
                 'Content-Type': 'application/verify',
                 'Content-Length': len(frag_archives[frag_index]),
                 'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
@@ -2647,6 +2658,59 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.body, frag_archives[frag_index])
+
+            # check the diskfile is durable
+            df_mgr = diskfile.ECDiskFileManager(self.conf,
+                                                self.object_controller.logger)
+            df = df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o', policy,
+                                     frag_prefs=[])
+            with df.open():
+                self.assertEqual(ts, df.data_timestamp)
+                self.assertEqual(df.data_timestamp, df.durable_timestamp)
+
+    def test_EC_PUT_GET_data_no_commit(self):
+        for policy in self.ec_policies:
+            ts = next(self.ts)
+            raw_data = (b'VERIFY' * policy.ec_segment_size)[:-432]
+            frag_archives = encode_frag_archive_bodies(policy, raw_data)
+            frag_index = random.randint(0, len(frag_archives) - 1)
+            # put EC frag archive
+            req = Request.blank('/sda1/p/a/c/o', method='PUT', headers={
+                'X-Timestamp': ts.internal,
+                'Content-Type': 'application/verify',
+                'Content-Length': len(frag_archives[frag_index]),
+                'X-Backend-No-Commit': 'true',
+                'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
+                'X-Backend-Storage-Policy-Index': int(policy),
+            })
+            req.body = frag_archives[frag_index]
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+            # get EC frag archive will 404 - nothing durable...
+            req = Request.blank('/sda1/p/a/c/o', headers={
+                'X-Backend-Storage-Policy-Index': int(policy),
+            })
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 404)
+
+            # ...unless we explicitly request *any* fragment...
+            req = Request.blank('/sda1/p/a/c/o', headers={
+                'X-Backend-Storage-Policy-Index': int(policy),
+                'X-Backend-Fragment-Preferences': '[]',
+            })
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, frag_archives[frag_index])
+
+            # check the diskfile is not durable
+            df_mgr = diskfile.ECDiskFileManager(self.conf,
+                                                self.object_controller.logger)
+            df = df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o', policy,
+                                     frag_prefs=[])
+            with df.open():
+                self.assertEqual(ts, df.data_timestamp)
+                self.assertIsNone(df.durable_timestamp)
 
     def test_EC_GET_quarantine_invalid_frag_archive(self):
         policy = random.choice(self.ec_policies)
@@ -2773,6 +2837,203 @@ class TestObjectController(unittest.TestCase):
                             'Expected file %r not found in %r for policy %r'
                             % (data_file, os.listdir(obj_dir), int(policy)))
             rmtree(obj_dir)
+
+    def test_PUT_next_part_power(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+        timestamp = utils.Timestamp(int(time())).internal
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Backend-Next-Part-Power': part_power + 1}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % old_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+
+        self.assertEqual(resp.status_int, 201)
+
+        def check_file(part):
+            data_file = os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_), timestamp + '.data')
+            self.assertTrue(os.path.isfile(data_file))
+
+        check_file(old_part)
+        check_file(new_part)
+
+    def test_PUT_next_part_power_eexist(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+        timestamp = utils.Timestamp(int(time())).internal
+
+        # There's no substitute for the real thing ;-)
+        tpool.execute = self._orig_tpool_exc
+
+        # This is a little disingenuous, but it's easier than reproducing
+        # the actual race that could lead to this EEXIST
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Trans-Id': 'txn1'}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % new_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # The write should succeed, but the relink will fail
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Backend-Next-Part-Power': part_power + 1,
+                   'X-Trans-Id': 'txn2'}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % old_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        def check_file(part):
+            data_file = os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_), timestamp + '.data')
+            self.assertTrue(os.path.isfile(data_file))
+
+        check_file(old_part)
+        check_file(new_part)
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertIn('[Errno 17] File exists', error_lines[0])
+        self.assertEqual([], error_lines[1:])
+        log_extras = self.logger.log_dict['error'][0][1]['extra']
+        self.assertEqual('txn2', log_extras.get('txn_id'))
+
+    def test_PUT_next_part_power_races_around_makedirs_eexist(self):
+        # simulate two 'concurrent' racing to create the new object dir in the
+        # new partition and check that relinking tolerates the dir already
+        # existing when they attempt to create it
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+
+        def make_request(timestamp):
+            headers = {'X-Timestamp': timestamp.internal,
+                       'Content-Length': '6',
+                       'Content-Type': 'application/octet-stream',
+                       'X-Backend-Storage-Policy-Index': int(policy),
+                       'X-Backend-Next-Part-Power': part_power + 1}
+            req = Request.blank(
+                '/sda1/%s/a/c/o' % old_part, method='PUT',
+                headers=headers, body=b'VERIFY')
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+        def data_file(part, timestamp):
+            return os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_),
+                timestamp.internal + '.data')
+
+        ts_1 = next(self.ts)
+        ts_2 = next(self.ts)
+        calls = []
+        orig_makedirs = os.makedirs
+
+        def mock_makedirs(path, *args, **kwargs):
+            # let another request catch up just as the first is about to create
+            # the next part power object dir, then pretend the first request
+            # process actually makes the dir
+            if path == os.path.dirname(data_file(new_part, ts_1)):
+                calls.append(path)
+                if len(calls) == 1:
+                    # pretend 'yield' to other request process
+                    make_request(ts_2)
+                if len(calls) == 2:
+                    # pretend 'yield' back to first request process for
+                    # its call to makedirs
+                    orig_makedirs(calls[0])
+            return orig_makedirs(path, *args, **kwargs)
+        with mock.patch('swift.obj.diskfile.os.makedirs', mock_makedirs):
+            make_request(ts_1)
+
+        self.assertEqual(
+            [os.path.dirname(data_file(new_part, ts_1)),
+             os.path.dirname(data_file(new_part, ts_1))], calls)
+        self.assertTrue(os.path.isfile(data_file(old_part, ts_2)))
+        self.assertTrue(os.path.isfile(data_file(new_part, ts_2)))
+        self.assertFalse(os.path.isfile(data_file(new_part, ts_1)))
+        self.assertFalse(os.path.isfile(data_file(old_part, ts_1)))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual([], error_lines)
+
+    def test_PUT_next_part_power_races_around_makedirs_enoent(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+
+        def make_request(timestamp):
+            headers = {'X-Timestamp': timestamp.internal,
+                       'Content-Length': '6',
+                       'Content-Type': 'application/octet-stream',
+                       'X-Backend-Storage-Policy-Index': int(policy),
+                       'X-Backend-Next-Part-Power': part_power + 1}
+            req = Request.blank(
+                '/sda1/%s/a/c/o' % old_part, method='PUT',
+                headers=headers, body=b'VERIFY')
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+        def data_file(part, timestamp):
+            return os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_),
+                timestamp.internal + '.data')
+
+        ts_1 = next(self.ts)
+        ts_2 = next(self.ts)
+        calls = []
+        orig_makedirs = os.makedirs
+
+        def mock_makedirs(path, *args, **kwargs):
+            # let another request race ahead just as the first is about to
+            # create the next part power object dir
+            if path == os.path.dirname(data_file(new_part, ts_1)):
+                calls.append(path)
+                if len(calls) == 1:
+                    # pretend 'yield' to other request process
+                    make_request(ts_2)
+            return orig_makedirs(path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.os.makedirs', mock_makedirs):
+            make_request(ts_1)
+
+        self.assertEqual(
+            [os.path.dirname(data_file(new_part, ts_1)),
+             os.path.dirname(data_file(new_part, ts_1))], calls)
+        self.assertTrue(os.path.isfile(data_file(old_part, ts_2)))
+        self.assertTrue(os.path.isfile(data_file(new_part, ts_2)))
+        self.assertFalse(os.path.isfile(data_file(new_part, ts_1)))
+        self.assertFalse(os.path.isfile(data_file(old_part, ts_1)))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual([], error_lines)
 
     def test_HEAD(self):
         # Test swift.obj.server.ObjectController.HEAD
@@ -3666,10 +3927,8 @@ class TestObjectController(unittest.TestCase):
 
     def _create_ondisk_fragments(self, policy):
         # Create some on disk files...
-        ts_iter = make_timestamp_iter()
-
         # PUT at ts_0
-        ts_0 = next(ts_iter)
+        ts_0 = next(self.ts)
         body = b'OLDER'
         headers = {'X-Timestamp': ts_0.internal,
                    'Content-Length': '5',
@@ -3689,7 +3948,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 201)
 
         # POST at ts_1
-        ts_1 = next(ts_iter)
+        ts_1 = next(self.ts)
         headers = {'X-Timestamp': ts_1.internal,
                    'X-Backend-Storage-Policy-Index': int(policy)}
         headers['X-Object-Meta-Test'] = 'abc'
@@ -3700,7 +3959,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 202)
 
         # PUT again at ts_2 but without making the data file durable
-        ts_2 = next(ts_iter)
+        ts_2 = next(self.ts)
         body = b'NEWER'
         headers = {'X-Timestamp': ts_2.internal,
                    'Content-Length': '5',
@@ -3737,7 +3996,7 @@ class TestObjectController(unittest.TestCase):
                     'X-Backend-Durable-Timestamp': ts_0.internal,
                     'X-Object-Sysmeta-Ec-Frag-Index': '0',
                     'X-Object-Meta-Test': 'abc'}
-                self.assertDictContainsSubset(expect, resp.headers)
+                self._assertDictContainsSubset(expect, resp.headers)
                 self.assertEqual(backend_frags, json.loads(
                     resp.headers['X-Backend-Fragments']))
 
@@ -3748,7 +4007,7 @@ class TestObjectController(unittest.TestCase):
                     'X-Backend-Timestamp': ts_2.internal,
                     'X-Backend-Data-Timestamp': ts_2.internal,
                     'X-Backend-Durable-Timestamp': ts_2.internal}
-                self.assertDictContainsSubset(expect, resp.headers)
+                self._assertDictContainsSubset(expect, resp.headers)
                 self.assertNotIn('X-Object-Meta-Test', resp.headers)
 
             # Sanity check: Request with no preferences should default to the
@@ -3808,7 +4067,7 @@ class TestObjectController(unittest.TestCase):
                     'X-Backend-Data-Timestamp': ts_2.internal,
                     'X-Backend-Durable-Timestamp': ts_0.internal,
                     'X-Object-Sysmeta-Ec-Frag-Index': '2'}
-                self.assertDictContainsSubset(expect, resp.headers)
+                self._assertDictContainsSubset(expect, resp.headers)
                 self.assertEqual(backend_frags, json.loads(
                     resp.headers['X-Backend-Fragments']))
                 self.assertNotIn('X-Object-Meta-Test', resp.headers)
@@ -3923,7 +4182,7 @@ class TestObjectController(unittest.TestCase):
                                              policy=POLICIES.legacy)
         disk_file.open()
         file_name = os.path.basename(disk_file._data_file)
-        etag = md5()
+        etag = md5(usedforsecurity=False)
         etag.update(b'VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp, 'name': '/a/c/o',
@@ -3985,7 +4244,7 @@ class TestObjectController(unittest.TestCase):
                                              policy=POLICIES.legacy)
         disk_file.open(timestamp)
         file_name = os.path.basename(disk_file._data_file)
-        etag = md5()
+        etag = md5(usedforsecurity=False)
         etag.update(b'VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp, 'name': '/a/c/o',
@@ -4316,7 +4575,7 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
                 'X-Size': len(b'test1'),
-                'X-Etag': md5(b'test1').hexdigest(),
+                'X-Etag': md5(b'test1', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/plain',
                 'X-Timestamp': create_timestamp,
             }
@@ -4356,7 +4615,7 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
                 'X-Size': len(b'test2'),
-                'X-Etag': md5(b'test2').hexdigest(),
+                'X-Etag': md5(b'test2', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/html',
                 'X-Timestamp': offset_timestamp,
             }
@@ -4395,7 +4654,7 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
                 'X-Size': len(b'test3'),
-                'X-Etag': md5(b'test3').hexdigest(),
+                'X-Etag': md5(b'test3', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/enriched',
                 'X-Timestamp': overwrite_timestamp,
             }
@@ -4564,7 +4823,7 @@ class TestObjectController(unittest.TestCase):
             return False
 
         def my_hash_path(*args):
-            return md5(b'collide').hexdigest()
+            return md5(b'collide', usedforsecurity=False).hexdigest()
 
         with mock.patch("swift.obj.diskfile.hash_path", my_hash_path):
             with mock.patch("swift.obj.server.check_object_creation",
@@ -6378,6 +6637,30 @@ class TestObjectController(unittest.TestCase):
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 404)
 
+        # ...unless sending an x-backend-replication header...which lets you
+        # modify x-delete-at
+        now += 2
+        recreate_test_object(now)
+        the_time = delete_at_timestamp + 2
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-backend-replication': 'true',
+                     'x-delete-at': str(delete_at_timestamp + 100)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+        # ...so the object becomes accessible again even without an
+        # x-backend-replication header
+        the_time = delete_at_timestamp + 3
+        req = Request.blank(
+            '/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(the_time),
+                     'x-delete-at': str(delete_at_timestamp + 101)})
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 202)
+
     def test_DELETE_can_skip_updating_expirer_queue(self):
         policy = POLICIES.get_by_index(0)
         test_time = time()
@@ -6957,21 +7240,18 @@ class TestObjectController(unittest.TestCase):
         def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = diskfile.DiskFileManager._get_hashes
-        was_tpool_exe = tpool.execute
-        try:
-            diskfile.DiskFileManager._get_hashes = fake_get_hashes
-            tpool.execute = my_tpool_execute
-            req = Request.blank('/sda1/p/suff',
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
+            req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
             p_data = pickle.loads(resp.body)
             self.assertEqual(p_data, {1: 2})
-        finally:
-            tpool.execute = was_tpool_exe
-            diskfile.DiskFileManager._get_hashes = was_get_hashes
 
     def test_REPLICATE_pickle_protocol(self):
 
@@ -6981,25 +7261,22 @@ class TestObjectController(unittest.TestCase):
         def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = diskfile.DiskFileManager._get_hashes
-        was_tpool_exe = tpool.execute
-        try:
-            diskfile.DiskFileManager._get_hashes = fake_get_hashes
-            tpool.execute = my_tpool_execute
-            req = Request.blank('/sda1/p/suff',
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.server.pickle.dumps') as fake_pickle, \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
+            req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
-            with mock.patch('swift.obj.server.pickle.dumps') as fake_pickle:
-                fake_pickle.return_value = b''
-                req.get_response(self.object_controller)
-                # This is the key assertion: starting in Python 3.0, the
-                # default protocol version is 3, but such pickles can't be read
-                # on Python 2. As long as we may need to talk to a Python 2
-                # process, we need to cap our protocol version.
-                fake_pickle.assert_called_once_with({1: 2}, protocol=2)
-        finally:
-            tpool.execute = was_tpool_exe
-            diskfile.DiskFileManager._get_hashes = was_get_hashes
+            fake_pickle.return_value = b''
+            req.get_response(self.object_controller)
+            # This is the key assertion: starting in Python 3.0, the
+            # default protocol version is 3, but such pickles can't be read
+            # on Python 2. As long as we may need to talk to a Python 2
+            # process, we need to cap our protocol version.
+            fake_pickle.assert_called_once_with({1: 2}, protocol=2)
 
     def test_REPLICATE_timeout(self):
 
@@ -7009,18 +7286,17 @@ class TestObjectController(unittest.TestCase):
         def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = diskfile.DiskFileManager._get_hashes
-        was_tpool_exe = tpool.execute
-        try:
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
             diskfile.DiskFileManager._get_hashes = fake_get_hashes
             tpool.execute = my_tpool_execute
-            req = Request.blank('/sda1/p/suff',
+            req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
             self.assertRaises(Timeout, self.object_controller.REPLICATE, req)
-        finally:
-            tpool.execute = was_tpool_exe
-            diskfile.DiskFileManager._get_hashes = was_get_hashes
 
     def test_REPLICATE_reclaims_tombstones(self):
         conf = {'devices': self.testdir, 'mount_check': False,
@@ -7061,15 +7337,28 @@ class TestObjectController(unittest.TestCase):
             # tombstone still exists
             self.assertTrue(os.path.exists(tombstone_file))
 
-            # after reclaim REPLICATE will rehash
+            # after reclaim REPLICATE will mark invalid (but NOT rehash!)
             replicate_request = Request.blank(
                 '/sda1/0/%s' % suffix, method='REPLICATE',
                 headers={
                     'x-backend-storage-policy-index': int(policy),
                 })
-            the_future = time() + 200
-            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
-                mock_time.return_value = the_future
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
+                resp = replicate_request.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(None, pickle.loads(resp.body))
+            # no rehash means tombstone still exists...
+            self.assertTrue(os.path.exists(tombstone_file))
+
+            # but at some point (like the next pre-sync REPLICATE) it rehashes
+            replicate_request = Request.blank(
+                '/sda1/0/', method='REPLICATE',
+                headers={
+                    'x-backend-storage-policy-index': int(policy),
+                })
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
                 resp = replicate_request.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual({}, pickle.loads(resp.body))
@@ -7078,8 +7367,8 @@ class TestObjectController(unittest.TestCase):
 
             # N.B. with a small reclaim age like this - if proxy clocks get far
             # enough out of whack ...
-            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
-                mock_time.return_value = the_future
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
                 resp = delete_request.get_response(self.object_controller)
                 # we won't even create the tombstone
                 self.assertFalse(os.path.exists(tombstone_file))
@@ -7092,6 +7381,8 @@ class TestObjectController(unittest.TestCase):
                             headers={})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
+        self.assertEqual('True',
+                         resp.headers.get('X-Backend-Accept-No-Commit'))
 
     def test_PUT_with_full_drive(self):
 
@@ -7165,8 +7456,8 @@ class TestObjectController(unittest.TestCase):
     def test_serv_reserv(self):
         # Test replication_server flag was set from configuration file.
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertEqual(
-            object_server.ObjectController(conf).replication_server, None)
+        self.assertTrue(
+            object_server.ObjectController(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(
@@ -7276,26 +7567,28 @@ class TestObjectController(unittest.TestCase):
                          ' /sda1/p/a/c/o" 405 91 "-" "-" "-" 1.0000 "-"'
                          ' 1234 -'])
 
-    def test_call_incorrect_replication_method(self):
-        inbuf = StringIO()
+    def test_replication_server_call_all_methods(self):
+        inbuf = WsgiBytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.ObjectController(
             {'devices': self.testdir, 'mount_check': 'false',
-             'replication_server': 'true'}, logger=FakeLogger())
+             'replication_server': 'true'}, logger=debug_logger())
 
         def start_response(*args):
             """Sends args to outbuf"""
             outbuf.write(args[0])
 
-        obj_methods = ['DELETE', 'PUT', 'HEAD', 'GET', 'POST', 'OPTIONS']
+        obj_methods = ['PUT', 'HEAD', 'GET', 'POST', 'DELETE', 'OPTIONS']
         for method in obj_methods:
             env = {'REQUEST_METHOD': method,
+                   'HTTP_X_TIMESTAMP': next(self.ts).internal,
                    'SCRIPT_NAME': '',
-                   'PATH_INFO': '/sda1/p/a/c',
+                   'PATH_INFO': '/sda1/p/a/c/o',
                    'SERVER_NAME': '127.0.0.1',
                    'SERVER_PORT': '8080',
                    'SERVER_PROTOCOL': 'HTTP/1.0',
+                   'CONTENT_TYPE': 'text/plain',
                    'CONTENT_LENGTH': '0',
                    'wsgi.version': (1, 0),
                    'wsgi.url_scheme': 'http',
@@ -7306,7 +7599,7 @@ class TestObjectController(unittest.TestCase):
                    'wsgi.run_once': False}
             self.object_controller(env, start_response)
             self.assertEqual(errbuf.getvalue(), '')
-            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+            self.assertIn(outbuf.getvalue()[:4], ('201 ', '204 ', '200 '))
 
     def test_create_reserved_namespace_object(self):
         path = '/sda1/p/a/%sc/%so' % (utils.RESERVED_STR, utils.RESERVED_STR)
@@ -7369,7 +7662,7 @@ class TestObjectController(unittest.TestCase):
         self.object_controller = object_server.ObjectController(
             {'devices': self.testdir, 'mount_check': 'false',
              'replication_server': 'false', 'log_requests': 'false'},
-            logger=FakeLogger())
+            logger=debug_logger())
 
         def start_response(*args):
             # Sends args to outbuf
@@ -7664,10 +7957,11 @@ class TestObjectController(unittest.TestCase):
         test_data = b'obj data'
         footer_meta = {
             "X-Object-Sysmeta-Ec-Frag-Index": "7",
-            "Etag": md5(test_data).hexdigest(),
+            "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
         }
         footer_json = json.dumps(footer_meta).encode('ascii')
-        footer_meta_cksum = md5(footer_json).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_json, usedforsecurity=False).hexdigest().encode('ascii')
         test_doc = b"\r\n".join((
             b"--boundary123",
             b"X-Document: object body",
@@ -7908,10 +8202,11 @@ class TestObjectServer(unittest.TestCase):
         test_data = encode_frag_archive_bodies(POLICIES[1], b'obj data')[0]
         footer_meta = {
             "X-Object-Sysmeta-Ec-Frag-Index": "2",
-            "Etag": md5(test_data).hexdigest(),
+            "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
         }
         footer_json = json.dumps(footer_meta).encode('ascii')
-        footer_meta_cksum = md5(footer_json).hexdigest().encode('ascii')
+        footer_meta_cksum = md5(
+            footer_json, usedforsecurity=False).hexdigest().encode('ascii')
         test_doc = test_doc or b"\r\n".join((
             b"--boundary123",
             b"X-Document: object body",
@@ -8180,10 +8475,11 @@ class TestObjectServer(unittest.TestCase):
             # make footer doc
             footer_meta = {
                 "X-Object-Sysmeta-Ec-Frag-Index": "2",
-                "Etag": md5(test_data).hexdigest(),
+                "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
             }
             footer_json = json.dumps(footer_meta).encode('ascii')
-            footer_meta_cksum = md5(footer_json).hexdigest().encode('ascii')
+            footer_meta_cksum = md5(
+                footer_json, usedforsecurity=False).hexdigest().encode('ascii')
 
             # send most of the footer doc
             footer_doc = b"\r\n".join((

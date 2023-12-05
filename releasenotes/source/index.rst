@@ -7,6 +7,16 @@
 
    current
 
+   zed
+
+   yoga
+
+   xena
+
+   wallaby
+
+   victoria
+
    ussuri
 
    train

@@ -131,11 +131,12 @@ from six.moves.urllib.parse import urlparse
 
 from swift.common.request_helpers import html_escape
 from swift.common.utils import human_readable, split_path, config_true_value, \
-    quote, register_swift_info, get_logger
+    quote, get_logger
+from swift.common.registry import register_swift_info
 from swift.common.wsgi import make_env, WSGIContext
 from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND
 from swift.common.swob import Response, HTTPMovedPermanently, HTTPNotFound, \
-    Request, wsgi_quote, wsgi_to_str
+    Request, wsgi_quote, wsgi_to_str, str_to_wsgi
 from swift.proxy.controllers.base import get_container_info
 
 
@@ -230,7 +231,7 @@ class _StaticWebContext(WSGIContext):
 
         :param env: The original WSGI environment dict.
         :param start_response: The original WSGI start_response hook.
-        :param prefix: Any prefix desired for the container listing.
+        :param prefix: Any WSGI-str prefix desired for the container listing.
         """
         label = wsgi_to_str(env['PATH_INFO'])
         if self._listings_label:
@@ -281,7 +282,7 @@ class _StaticWebContext(WSGIContext):
         body = b''.join(resp)
         if body:
             listing = json.loads(body)
-        if not listing:
+        if prefix and not listing:
             resp = HTTPNotFound()(env, self._start_response)
             return self._error_response(resp, env, start_response)
         headers = {'Content-Type': 'text/html; charset=UTF-8'}
@@ -321,7 +322,7 @@ class _StaticWebContext(WSGIContext):
                 subdir = item['subdir'] if six.PY3 else  \
                     item['subdir'].encode('utf-8')
                 if prefix:
-                    subdir = subdir[len(prefix):]
+                    subdir = subdir[len(wsgi_to_str(prefix)):]
                 body += '   <tr class="item subdir">\n' \
                         '    <td class="colname"><a href="%s">%s</a></td>\n' \
                         '    <td class="colsize">&nbsp;</td>\n' \
@@ -333,7 +334,7 @@ class _StaticWebContext(WSGIContext):
                 name = item['name'] if six.PY3 else  \
                     item['name'].encode('utf-8')
                 if prefix:
-                    name = name[len(prefix):]
+                    name = name[len(wsgi_to_str(prefix)):]
                 content_type = item['content_type'] if six.PY3 else  \
                     item['content_type'].encode('utf-8')
                 bytes = human_readable(item['bytes'])
@@ -408,7 +409,7 @@ class _StaticWebContext(WSGIContext):
         tmp_env['HTTP_USER_AGENT'] = \
             '%s StaticWeb' % env.get('HTTP_USER_AGENT')
         tmp_env['swift.source'] = 'SW'
-        tmp_env['PATH_INFO'] += self._index
+        tmp_env['PATH_INFO'] += str_to_wsgi(self._index)
         resp = self._app_call(tmp_env)
         status_int = self._get_status_int()
         if status_int == HTTP_NOT_FOUND:
@@ -465,7 +466,7 @@ class _StaticWebContext(WSGIContext):
             tmp_env['swift.source'] = 'SW'
             if not tmp_env['PATH_INFO'].endswith('/'):
                 tmp_env['PATH_INFO'] += '/'
-            tmp_env['PATH_INFO'] += self._index
+            tmp_env['PATH_INFO'] += str_to_wsgi(self._index)
             resp = self._app_call(tmp_env)
             status_int = self._get_status_int()
             if is_success(status_int) or is_redirection(status_int):

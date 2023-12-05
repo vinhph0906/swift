@@ -19,7 +19,6 @@ import socket
 from logging import DEBUG
 from math import sqrt
 from time import time
-from hashlib import md5
 import itertools
 
 from eventlet import GreenPool, sleep, Timeout
@@ -31,10 +30,11 @@ from swift.common.constraints import check_drive
 from swift.common.direct_client import direct_delete_container, \
     direct_delete_object, direct_get_container
 from swift.common.exceptions import ClientException
+from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER
 from swift.common.ring import Ring
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, whataremyips, config_true_value, \
-    Timestamp
+    Timestamp, md5, node_to_string
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import POLICIES, PolicyError
 
@@ -65,7 +65,7 @@ class AccountReaper(Daemon):
         self.logger = logger or get_logger(conf, log_route='account-reaper')
         self.devices = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
-        self.interval = int(conf.get('interval', 3600))
+        self.interval = float(conf.get('interval', 3600))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.account_ring = None
         self.container_ring = None
@@ -270,8 +270,9 @@ class AccountReaper(Daemon):
                             container_ = container.encode('utf-8')
                         else:
                             container_ = container
-                        this_shard = int(md5(container_).hexdigest(), 16) % \
-                            len(nodes)
+                        this_shard = (
+                            int(md5(container_, usedforsecurity=False)
+                                .hexdigest(), 16) % len(nodes))
                         if container_shard not in (this_shard, None):
                             continue
 
@@ -370,22 +371,22 @@ class AccountReaper(Daemon):
                     node, part, account, container,
                     marker=marker,
                     conn_timeout=self.conn_timeout,
-                    response_timeout=self.node_timeout)
+                    response_timeout=self.node_timeout,
+                    headers={USE_REPLICATION_NETWORK_HEADER: 'true'})
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
                 self.logger.increment('return_codes.2')
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 self.stats_return_codes[err.http_status // 100] = \
                     self.stats_return_codes.get(err.http_status // 100, 0) + 1
                 self.logger.increment(
                     'return_codes.%d' % (err.http_status // 100,))
             except (Timeout, socket.error):
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
             if not objects:
                 break
             try:
@@ -418,7 +419,8 @@ class AccountReaper(Daemon):
                              'X-Account-Partition': str(account_partition),
                              'X-Account-Device': anode['device'],
                              'X-Account-Override-Deleted': 'yes',
-                             'X-Timestamp': timestamp.internal})
+                             'X-Timestamp': timestamp.internal,
+                             USE_REPLICATION_NETWORK_HEADER: 'true'})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
@@ -426,7 +428,7 @@ class AccountReaper(Daemon):
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('containers_failures')
                 self.stats_return_codes[err.http_status // 100] = \
@@ -435,8 +437,7 @@ class AccountReaper(Daemon):
                     'return_codes.%d' % (err.http_status // 100,))
             except (Timeout, socket.error):
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('containers_failures')
         if successes > failures:
@@ -494,7 +495,8 @@ class AccountReaper(Daemon):
                              'X-Container-Partition': str(container_partition),
                              'X-Container-Device': cnode['device'],
                              'X-Backend-Storage-Policy-Index': policy_index,
-                             'X-Timestamp': timestamp.internal})
+                             'X-Timestamp': timestamp.internal,
+                             USE_REPLICATION_NETWORK_HEADER: 'true'})
                 successes += 1
                 self.stats_return_codes[2] = \
                     self.stats_return_codes.get(2, 0) + 1
@@ -502,7 +504,7 @@ class AccountReaper(Daemon):
             except ClientException as err:
                 if self.logger.getEffectiveLevel() <= DEBUG:
                     self.logger.exception(
-                        'Exception with %(ip)s:%(port)s/%(device)s', node)
+                        'Exception with %s', node_to_string(node))
                 failures += 1
                 self.logger.increment('objects_failures')
                 self.stats_return_codes[err.http_status // 100] = \
@@ -513,8 +515,7 @@ class AccountReaper(Daemon):
                 failures += 1
                 self.logger.increment('objects_failures')
                 self.logger.error(
-                    'Timeout Exception with %(ip)s:%(port)s/%(device)s',
-                    node)
+                    'Timeout Exception with %s', node_to_string(node))
             if successes > failures:
                 self.stats_objects_deleted += 1
                 self.logger.increment('objects_deleted')

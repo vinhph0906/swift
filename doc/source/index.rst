@@ -88,6 +88,7 @@ Developer Documentation
     development_auth
     development_middleware
     development_ondisk_backends
+    development_watchers
 
 Administrator Documentation
 ===========================
@@ -104,6 +105,8 @@ Administrator Documentation
     ops_runbook/index
     admin/index
     install/index
+    config/index
+
 
 Object Storage v1 REST API Documentation
 ========================================
@@ -163,6 +166,7 @@ Source Documentation
     object
     misc
     middleware
+    audit_watchers
 
 
 Indices and tables

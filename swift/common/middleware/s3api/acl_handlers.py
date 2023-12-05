@@ -167,7 +167,7 @@ class BaseAclHandler(object):
             try:
                 elem = fromstring(body, ACL.root_tag)
                 acl = ACL.from_elem(
-                    elem, True, self.req.allow_no_owner)
+                    elem, True, self.req.conf.allow_no_owner)
             except(XMLSyntaxError, DocumentInvalid):
                 raise MalformedACLError()
             except Exception as e:
@@ -248,6 +248,9 @@ class S3AclHandler(BaseAclHandler):
     """
     S3AclHandler: Handler for S3AclController
     """
+    def HEAD(self, app):
+        self._handle_acl(app, 'HEAD', permission='READ_ACP')
+
     def GET(self, app):
         self._handle_acl(app, 'HEAD', permission='READ_ACP')
 

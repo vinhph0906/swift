@@ -87,6 +87,9 @@ class RingBuilder(object):
         if part_power > 32:
             raise ValueError("part_power must be at most 32 (was %d)"
                              % (part_power,))
+        if part_power < 0:
+            raise ValueError("part_power must be at least 0 (was %d)"
+                             % (part_power,))
         if replicas < 1:
             raise ValueError("replicas must be at least 1 (was %.6f)"
                              % (replicas,))
@@ -178,16 +181,16 @@ class RingBuilder(object):
     @contextmanager
     def debug(self):
         """
-        Temporarily enables debug logging, useful in tests, e.g.
+        Temporarily enables debug logging, useful in tests, e.g.::
 
             with rb.debug():
                 rb.rebalance()
         """
-        self.logger.disabled = False
+        old_val, self.logger.disabled = self.logger.disabled, False
         try:
             yield
         finally:
-            self.logger.disabled = True
+            self.logger.disabled = old_val
 
     @property
     def min_part_seconds_left(self):
@@ -1437,17 +1440,17 @@ class RingBuilder(object):
             {(): 3.0,
             (1,): 3.0,
             (1, 1): 1.0,
-            (1, 1, '127.0.0.1:6010'): 1.0,
-            (1, 1, '127.0.0.1:6010', 0): 1.0,
+            (1, 1, '127.0.0.1:6210'): 1.0,
+            (1, 1, '127.0.0.1:6210', 0): 1.0,
             (1, 2): 1.0,
-            (1, 2, '127.0.0.1:6020'): 1.0,
-            (1, 2, '127.0.0.1:6020', 1): 1.0,
+            (1, 2, '127.0.0.1:6220'): 1.0,
+            (1, 2, '127.0.0.1:6220', 1): 1.0,
             (1, 3): 1.0,
-            (1, 3, '127.0.0.1:6030'): 1.0,
-            (1, 3, '127.0.0.1:6030', 2): 1.0,
+            (1, 3, '127.0.0.1:6230'): 1.0,
+            (1, 3, '127.0.0.1:6230', 2): 1.0,
             (1, 4): 1.0,
-            (1, 4, '127.0.0.1:6040'): 1.0,
-            (1, 4, '127.0.0.1:6040', 3): 1.0}
+            (1, 4, '127.0.0.1:6240'): 1.0,
+            (1, 4, '127.0.0.1:6240', 3): 1.0}
 
         """
         # Used by walk_tree to know what entries to create for each recursive

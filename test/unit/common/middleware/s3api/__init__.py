@@ -23,15 +23,19 @@ from swift.common import swob
 
 from swift.common.middleware.s3api.s3api import filter_factory
 from swift.common.middleware.s3api.etree import fromstring
-from swift.common.middleware.s3api.utils import Config
 
-from test.unit import debug_logger
+from test.debug_logger import debug_logger
 from test.unit.common.middleware.s3api.helpers import FakeSwift
 
 
 class FakeApp(object):
+    container_existence_skip_cache = 0.0
+    account_existence_skip_cache = 0.0
+
     def __init__(self):
+        self._pipeline_final_app = self
         self.swift = FakeSwift()
+        self.logger = debug_logger()
 
     def _update_s3_path_info(self, env):
         """
@@ -50,6 +54,18 @@ class FakeApp(object):
         if 's3api.auth_details' in env:
             self._update_s3_path_info(env)
 
+        if env['REQUEST_METHOD'] == 'TEST':
+
+            def authorize_cb(req):
+                # Assume swift owner, if not yet set
+                req.environ.setdefault('REMOTE_USER', 'authorized')
+                req.environ.setdefault('swift_owner', True)
+                # But then default to blocking authz, to ensure we've replaced
+                # the default auth system
+                return swob.HTTPForbidden(request=req)
+
+            env['swift.authorize'] = authorize_cb
+
         return self.swift(env, start_response)
 
 
@@ -58,8 +74,8 @@ class S3ApiTestCase(unittest.TestCase):
         unittest.TestCase.__init__(self, name)
 
     def setUp(self):
-        # setup default config
-        self.conf = Config({
+        # setup default config dict
+        self.conf = {
             'allow_no_owner': False,
             'location': 'us-east-1',
             'dns_compliant_bucket_names': True,
@@ -69,19 +85,20 @@ class S3ApiTestCase(unittest.TestCase):
             's3_acl': False,
             'storage_domain': 'localhost',
             'auth_pipeline_check': True,
-            'max_upload_part_num': 1000,
+            'max_upload_part_num': 10000,
             'check_bucket_owner': False,
             'force_swift_request_proxy_log': False,
             'allow_multipart_uploads': True,
             'min_segment_size': 5242880,
-        })
-        # those 2 settings has existed the original test setup
-        self.conf.log_level = 'debug'
+            'log_level': 'debug'
+        }
 
         self.app = FakeApp()
         self.swift = self.app.swift
+        # note: self.conf has no __file__ key so check_pipeline will be skipped
+        # when constructing self.s3api
         self.s3api = filter_factory({}, **self.conf)(self.app)
-        self.s3api.logger = self.swift.logger = debug_logger()
+        self.logger = self.s3api.logger = self.swift.logger = debug_logger()
 
         self.swift.register('HEAD', '/v1/AUTH_test',
                             swob.HTTPOk, {}, None)
@@ -123,7 +140,8 @@ class S3ApiTestCase(unittest.TestCase):
         return elem.find('./Message').text
 
     def _test_method_error(self, method, path, response_class, headers={},
-                           env={}, expected_xml_tags=None):
+                           env={}, expected_xml_tags=None,
+                           expected_status=None):
         if not path.startswith('/'):
             path = '/' + path  # add a missing slash before the path
 
@@ -137,6 +155,8 @@ class S3ApiTestCase(unittest.TestCase):
         env.update({'REQUEST_METHOD': method})
         req = swob.Request.blank(path, environ=env, headers=headers)
         status, headers, body = self.call_s3api(req)
+        if expected_status is not None:
+            self.assertEqual(status, expected_status)
         if expected_xml_tags is not None:
             elem = fromstring(body, 'Error')
             self.assertEqual(set(expected_xml_tags),

@@ -59,6 +59,7 @@ remote_addr         The IP address of the other end of the TCP connection.
                     (anonymizable)
 end_time            Timestamp of the request. (timestamp)
 method              The HTTP verb in the request.
+domain              The domain in the request. (anonymizable)
 path                The path portion of the request. (anonymizable)
 protocol            The transport protocol used (currently one of http or
                     https).
@@ -93,6 +94,9 @@ container           The container part extracted from the path of the request.
 object              The object part extracted from the path of the request.
                     (anonymizable)
 pid                 PID of the process emitting the log line.
+wire_status_int     The status sent to the client, which may be different than
+                    the logged response code if there was an error during the
+                    body of the request or a disconnect.
 =================== ==========================================================
 
 In one log line, all of the above fields are space-separated and url-encoded.
@@ -177,7 +181,8 @@ user_agent          The value of the HTTP User-Agent header. Swift services
                     the process ID, such as ``"proxy-server <pid of the
                     proxy>"`` or ``"object-updater <pid of the object
                     updater>"``.
-request_time        The duration of the request.
+request_time        The time between request received and response started.
+                    **Note**: This includes transfer time on PUT, but not GET.
 additional_info     Additional useful information.
 server_pid          The process id of the server
 policy_index        The value of the storage policy index.

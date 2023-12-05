@@ -17,7 +17,6 @@ import json
 import os
 import time
 import traceback
-from swift import gettext_ as _
 
 from eventlet import Timeout
 
@@ -185,8 +184,9 @@ class AccountController(BaseStorageServer):
                     broker.initialize(timestamp.internal)
                 except DatabaseAlreadyExists:
                     pass
-            if req.headers.get('x-account-override-deleted', 'no').lower() != \
-                    'yes' and broker.is_deleted():
+            if (req.headers.get('x-account-override-deleted', 'no').lower() !=
+                    'yes' and broker.is_deleted()) \
+                    or not os.path.exists(broker.db_file):
                 return HTTPNotFound(request=req)
             broker.put_container(container, req.headers['x-put-timestamp'],
                                  req.headers['x-delete-timestamp'],
@@ -324,8 +324,8 @@ class AccountController(BaseStorageServer):
             except HTTPException as error_response:
                 res = error_response
             except (Exception, Timeout):
-                self.logger.exception(_('ERROR __call__ error with %(method)s'
-                                        ' %(path)s '),
+                self.logger.exception('ERROR __call__ error with %(method)s'
+                                      ' %(path)s ',
                                       {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         if self.log_requests:

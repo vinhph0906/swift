@@ -17,7 +17,10 @@ import copy
 import json
 
 from swift.common.constraints import MAX_OBJECT_NAME_LENGTH
-from swift.common.utils import public, StreamingPile, get_swift_info
+from swift.common.http import HTTP_NO_CONTENT
+from swift.common.swob import str_to_wsgi
+from swift.common.utils import public, StreamingPile
+from swift.common.registry import get_swift_info
 
 from swift.common.middleware.s3api.controllers.base import Controller, \
     bucket_operation
@@ -78,10 +81,7 @@ class MultiObjectDeleteController(Controller):
             elem = fromstring(xml, 'Delete', self.logger)
 
             quiet = elem.find('./Quiet')
-            if quiet is not None and quiet.text.lower() == 'true':
-                self.quiet = True
-            else:
-                self.quiet = False
+            self.quiet = quiet is not None and quiet.text.lower() == 'true'
 
             delete_list = list(object_key_iter(elem))
             if len(delete_list) > self.conf.max_multi_delete_objects:
@@ -111,7 +111,7 @@ class MultiObjectDeleteController(Controller):
         def do_delete(base_req, key, version):
             req = copy.copy(base_req)
             req.environ = copy.copy(base_req.environ)
-            req.object_name = key
+            req.object_name = str_to_wsgi(key)
             if version:
                 req.params = {'version-id': version, 'symlink': 'get'}
 
@@ -127,8 +127,11 @@ class MultiObjectDeleteController(Controller):
 
                 resp = req.get_response(self.app, method='DELETE', query=query,
                                         headers={'Accept': 'application/json'})
-                # Have to read the response to actually do the SLO delete
-                if query.get('multipart-manifest'):
+                # If async segment cleanup is available, we expect to get
+                # back a 204; otherwise, the delete is synchronous and we
+                # have to read the response to actually do the SLO delete
+                if query.get('multipart-manifest') and \
+                        resp.status_int != HTTP_NO_CONTENT:
                     try:
                         delete_result = json.loads(resp.body)
                         if delete_result['Errors']:
@@ -144,8 +147,8 @@ class MultiObjectDeleteController(Controller):
                     except (ValueError, TypeError, KeyError):
                         # Logs get all the gory details
                         self.logger.exception(
-                            'Could not parse SLO delete response: %r',
-                            resp.body)
+                            'Could not parse SLO delete response (%s): %s',
+                            resp.status, resp.body)
                         # Client gets something more generic
                         return key, {'code': 'SLODeleteError',
                                      'message': 'Unexpected swift response'}

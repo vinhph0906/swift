@@ -17,7 +17,6 @@ import collections
 import errno
 import os
 import uuid
-from swift import gettext_ as _
 from time import ctime, time
 from random import choice, random
 from struct import unpack_from
@@ -52,52 +51,24 @@ from swift.common.middleware.versioned_writes.object_versioning import (
 # requiring deployment of the new /etc/swift/internal-client.conf
 ic_conf_body = """
 [DEFAULT]
-# swift_dir = /etc/swift
-# user = swift
-# You can specify default log routing here if you want:
-# log_name = swift
-# log_facility = LOG_LOCAL0
-# log_level = INFO
-# log_address = /dev/log
-#
-# comma separated list of functions to call to setup custom log handlers.
-# functions get passed: conf, name, log_to_console, log_route, fmt, logger,
-# adapted_logger
-# log_custom_handlers =
-#
-# If set, log_udp_host will override log_address
-# log_udp_host =
-# log_udp_port = 514
-#
-# You can enable StatsD logging here:
-# log_statsd_host =
-# log_statsd_port = 8125
-# log_statsd_default_sample_rate = 1.0
-# log_statsd_sample_rate_factor = 1.0
-# log_statsd_metric_prefix =
-
 [pipeline:main]
 pipeline = catch_errors proxy-logging cache symlink proxy-server
 
 [app:proxy-server]
 use = egg:swift#proxy
 account_autocreate = true
-# See proxy-server.conf-sample for options
 
 [filter:symlink]
 use = egg:swift#symlink
-# See proxy-server.conf-sample for options
 
 [filter:cache]
 use = egg:swift#memcache
-# See proxy-server.conf-sample for options
 
 [filter:proxy-logging]
 use = egg:swift#proxy_logging
 
 [filter:catch_errors]
 use = egg:swift#catch_errors
-# See proxy-server.conf-sample for options
 """.lstrip()
 
 
@@ -125,28 +96,28 @@ class ContainerSync(Daemon):
     An example may help. Assume replica count is 3 and perfectly matching
     ROWIDs starting at 1.
 
-        First sync run, database has 6 rows:
+       First sync run, database has 6 rows:
 
-            * SyncPoint1 starts as -1.
-            * SyncPoint2 starts as -1.
-            * No rows between points, so no "all updates" rows.
-            * Six rows newer than SyncPoint1, so a third of the rows are sent
-              by node 1, another third by node 2, remaining third by node 3.
-            * SyncPoint1 is set as 6 (the newest ROWID known).
-            * SyncPoint2 is left as -1 since no "all updates" rows were synced.
+       * SyncPoint1 starts as -1.
+       * SyncPoint2 starts as -1.
+       * No rows between points, so no "all updates" rows.
+       * Six rows newer than SyncPoint1, so a third of the rows are sent
+         by node 1, another third by node 2, remaining third by node 3.
+       * SyncPoint1 is set as 6 (the newest ROWID known).
+       * SyncPoint2 is left as -1 since no "all updates" rows were synced.
 
-        Next sync run, database has 12 rows:
+       Next sync run, database has 12 rows:
 
-            * SyncPoint1 starts as 6.
-            * SyncPoint2 starts as -1.
-            * The rows between -1 and 6 all trigger updates (most of which
-              should short-circuit on the remote end as having already been
-              done).
-            * Six more rows newer than SyncPoint1, so a third of the rows are
-              sent by node 1, another third by node 2, remaining third by node
-              3.
-            * SyncPoint1 is set as 12 (the newest ROWID known).
-            * SyncPoint2 is set as 6 (the newest "all updates" ROWID).
+       * SyncPoint1 starts as 6.
+       * SyncPoint2 starts as -1.
+       * The rows between -1 and 6 all trigger updates (most of which
+         should short-circuit on the remote end as having already been
+         done).
+       * Six more rows newer than SyncPoint1, so a third of the rows are
+         sent by node 1, another third by node 2, remaining third by node
+         3.
+       * SyncPoint1 is set as 12 (the newest ROWID known).
+       * SyncPoint2 is set as 6 (the newest "all updates" ROWID).
 
     In this way, under normal circumstances each node sends its share of
     updates each run and just sends a batch of older updates to ensure nothing
@@ -157,13 +128,14 @@ class ContainerSync(Daemon):
     :param container_ring: If None, the <swift_dir>/container.ring.gz will be
                            loaded. This is overridden by unit tests.
     """
+    log_route = 'container-sync'
 
     def __init__(self, conf, container_ring=None, logger=None):
         #: The dict of configuration values from the [container-sync] section
         #: of the container-server.conf.
         self.conf = conf
         #: Logger to use for container-sync log lines.
-        self.logger = logger or get_logger(conf, log_route='container-sync')
+        self.logger = logger or get_logger(conf, log_route=self.log_route)
         #: Path to the local device mount points.
         self.devices = conf.get('devices', '/srv/node')
         #: Indicates whether mount points should be verified as actual mount
@@ -171,7 +143,7 @@ class ContainerSync(Daemon):
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         #: Minimum time between full scans. This is to keep the daemon from
         #: running wild on near empty systems.
-        self.interval = int(conf.get('interval', 300))
+        self.interval = float(conf.get('interval', 300))
         #: Maximum amount of time to spend syncing a container before moving on
         #: to the next one. If a container sync hasn't finished in this time,
         #: it'll just be resumed next scan.
@@ -233,22 +205,25 @@ class ContainerSync(Daemon):
         internal_client_conf_path = conf.get('internal_client_conf_path')
         if not internal_client_conf_path:
             self.logger.warning(
-                _('Configuration option internal_client_conf_path not '
-                  'defined. Using default configuration, See '
-                  'internal-client.conf-sample for options'))
+                'Configuration option internal_client_conf_path not '
+                'defined. Using default configuration, See '
+                'internal-client.conf-sample for options')
             internal_client_conf = ConfigString(ic_conf_body)
         else:
             internal_client_conf = internal_client_conf_path
         try:
             self.swift = InternalClient(
-                internal_client_conf, 'Swift Container Sync', request_tries)
+                internal_client_conf, 'Swift Container Sync', request_tries,
+                use_replication_network=True,
+                global_conf={'log_name': '%s-ic' % conf.get(
+                    'log_name', self.log_route)})
         except (OSError, IOError) as err:
             if err.errno != errno.ENOENT and \
                     not str(err).endswith(' not found'):
                 raise
             raise SystemExit(
-                _('Unable to load internal client from config: '
-                  '%(conf)r (%(error)s)')
+                'Unable to load internal client from config: '
+                '%(conf)r (%(error)s)'
                 % {'conf': internal_client_conf_path, 'error': err})
 
     def run_forever(self, *args, **kwargs):
@@ -271,7 +246,7 @@ class ContainerSync(Daemon):
         """
         Runs a single container sync scan.
         """
-        self.logger.info(_('Begin container sync "once" mode'))
+        self.logger.info('Begin container sync "once" mode')
         begin = time()
         for path in self.sync_store.synced_containers_generator():
             self.container_sync(path)
@@ -280,7 +255,7 @@ class ContainerSync(Daemon):
         self.report()
         elapsed = time() - begin
         self.logger.info(
-            _('Container sync "once" mode completed: %.02fs'), elapsed)
+            'Container sync "once" mode completed: %.02fs', elapsed)
 
     def report(self):
         """
@@ -288,8 +263,8 @@ class ContainerSync(Daemon):
         next report.
         """
         self.logger.info(
-            _('Since %(time)s: %(sync)s synced [%(delete)s deletes, %(put)s '
-              'puts], %(skip)s skipped, %(fail)s failed'),
+            'Since %(time)s: %(sync)s synced [%(delete)s deletes, %(put)s '
+            'puts], %(skip)s skipped, %(fail)s failed',
             {'time': ctime(self.reported),
              'sync': self.container_syncs,
              'delete': self.container_deletes,
@@ -305,16 +280,16 @@ class ContainerSync(Daemon):
 
     def container_report(self, start, end, sync_point1, sync_point2, info,
                          max_row):
-        self.logger.info(_('Container sync report: %(container)s, '
-                           'time window start: %(start)s, '
-                           'time window end: %(end)s, '
-                           'puts: %(puts)s, '
-                           'posts: %(posts)s, '
-                           'deletes: %(deletes)s, '
-                           'bytes: %(bytes)s, '
-                           'sync_point1: %(point1)s, '
-                           'sync_point2: %(point2)s, '
-                           'total_rows: %(total)s'),
+        self.logger.info('Container sync report: %(container)s, '
+                         'time window start: %(start)s, '
+                         'time window end: %(end)s, '
+                         'puts: %(puts)s, '
+                         'posts: %(posts)s, '
+                         'deletes: %(deletes)s, '
+                         'bytes: %(bytes)s, '
+                         'sync_point1: %(point1)s, '
+                         'sync_point2: %(point2)s, '
+                         'total_rows: %(total)s',
                          {'container': '%s/%s' % (info['account'],
                                                   info['container']),
                           'start': start,
@@ -385,7 +360,7 @@ class ContainerSync(Daemon):
                     sync_to, self.allowed_sync_hosts, self.realms_conf)
                 if err:
                     self.logger.info(
-                        _('ERROR %(db_file)s: %(validate_sync_to_err)s'),
+                        'ERROR %(db_file)s: %(validate_sync_to_err)s',
                         {'db_file': str(broker),
                          'validate_sync_to_err': err})
                     self.container_failures += 1
@@ -454,7 +429,7 @@ class ContainerSync(Daemon):
         except (Exception, Timeout):
             self.container_failures += 1
             self.logger.increment('failures')
-            self.logger.exception(_('ERROR Syncing %s'),
+            self.logger.exception('ERROR Syncing %s',
                                   broker if broker else path)
 
     def _update_sync_to_headers(self, name, sync_to, user_key,
@@ -619,8 +594,8 @@ class ContainerSync(Daemon):
                     if exc:
                         raise exc
                     raise Exception(
-                        _('Unknown exception trying to GET: '
-                          '%(account)r %(container)r %(object)r'),
+                        'Unknown exception trying to GET: '
+                        '%(account)r %(container)r %(object)r' %
                         {'account': info['account'],
                          'container': info['container'],
                          'object': row['name']})
@@ -646,27 +621,27 @@ class ContainerSync(Daemon):
         except ClientException as err:
             if err.http_status == HTTP_UNAUTHORIZED:
                 self.logger.info(
-                    _('Unauth %(sync_from)r => %(sync_to)r'),
+                    'Unauth %(sync_from)r => %(sync_to)r',
                     {'sync_from': '%s/%s' %
                         (quote(info['account']), quote(info['container'])),
                      'sync_to': sync_to})
             elif err.http_status == HTTP_NOT_FOUND:
                 self.logger.info(
-                    _('Not found %(sync_from)r => %(sync_to)r \
-                      - object %(obj_name)r'),
+                    'Not found %(sync_from)r => %(sync_to)r \
+                    - object %(obj_name)r',
                     {'sync_from': '%s/%s' %
                         (quote(info['account']), quote(info['container'])),
                      'sync_to': sync_to, 'obj_name': row['name']})
             else:
                 self.logger.exception(
-                    _('ERROR Syncing %(db_file)s %(row)s'),
+                    'ERROR Syncing %(db_file)s %(row)s',
                     {'db_file': str(broker), 'row': row})
             self.container_failures += 1
             self.logger.increment('failures')
             return False
         except (Exception, Timeout):
             self.logger.exception(
-                _('ERROR Syncing %(db_file)s %(row)s'),
+                'ERROR Syncing %(db_file)s %(row)s',
                 {'db_file': str(broker), 'row': row})
             self.container_failures += 1
             self.logger.increment('failures')

@@ -1,3 +1,980 @@
+swift (2.31.1, OpenStack Antelope)
+
+    * Sharding fixes
+
+      * Shards no longer report stats to the root database when they are in
+        the CREATED state.
+
+      * Sharding metadata is no longer cleared when databases are deleted.
+        This could previously cause deleted shards that still had rows to
+        become stuck and never move them to the correct database.
+
+      * Fixed a performance regression in the handling of misplaced objects.
+
+      * Swift path and on-disk path are now included with all sharder logging.
+
+    * `s3token` no longer mangles request paths that include the Access Key ID.
+
+    * User metadata is now exposed via CORS when encryption is enabled,
+      matching the behavior when encryption is not enabled.
+
+    * Fewer backend requests are now required when account or container
+      information is missing from memcache.
+
+    * Fixed logging of IP and port in the proxy-server; in particular,
+      internal clients now correctly log about the replication IP/port.
+
+    * Fixed a bug in the object replicator that would cause an under-reporting
+      of failures.
+
+    * Various other minor bug fixes.
+
+
+swift (2.31.0)
+
+    * S3 API improvements
+
+      * Fixed a security issue in how `s3api` handles XML parsing that allowed
+        authenticated S3 clients to read arbitrary files from proxy servers.
+        Refer to CVE-2022-47950 for more information.
+
+      * Fixed a server error when handling malformed CompleteMultipartUpload
+        requests.
+
+      * Improved error reporting when attempting to set invalid `X-Delete-At`
+        or `X-Delete-After` values via the S3 API.
+
+    * Sharding improvements
+
+      * Sync more shard ranges from the root database to the shards. This
+        helps ensure shard range repairs effected at the root make their way
+        to shards that would otherwise be stuck trying to further divide
+        into sub-shards.
+
+      * Added a `merge` subcommand to `swift-manage-shard-ranges` to merge
+        arbitrary shard ranges into a container DB. Minimal safety checks
+        are performed; it should only be used for emergency shard range
+        manipulation by expert users.
+
+      * Improved performance of `delimiter` listings for sharded containers.
+
+      * Added more safety checks to the `repair` subcommand of
+        `swift-manage-shard-ranges`.
+
+      * Better handle `EOFError` and `KeyboardInterrupt` when prompting for
+        input in `swift-manage-shard-ranges`.
+
+      * Warnings are now emitted when sharding appears to have become stuck.
+        Use the new `container_sharding_timeout` option to configure the
+        "stuck" threshold; the default is 48 hours.
+
+      * Stop warning about transient overlaps when auditing shard ranges.
+
+    * Metrics improvements
+
+      * Added timing stats for memcached operations.
+
+      * Renamed and improved the granularity of shard range cache and
+        backend stats. Metrics dashboards may need to be updated.
+
+      * Emit stats when backend nodes are error-limited.
+
+    * Added support for Python 3.10.
+
+    * Added an optional `backend_ratelimit` middleware for backend servers.
+      See the backend server sample configuration files for more information.
+
+    * Added the ability to configure a chance to skip checking memcache when
+      querying account and container information. This allows some fraction
+      of traffic to go to disk and refresh memcache before the key ages out.
+      Recommended values for the new `account_existence_skip_cache_pct` and
+      `container_existence_skip_cache_pct` options are in the range of
+      0.0 to 0.01.
+
+    * Static large object segments may now be deleted asynchronously by
+      default. Operators may return to the old behavior by disabling the
+      `allow_async_delete` option in the `[filter:slo]` section
+      in their proxy-server.conf.
+
+    * Absolute-form request targets are now accepted. This enables access for
+      certain clients and SDKs (including some older versions of rclone that
+      were using an old version of aws-sdk-go).
+
+    * Fixed a path-rewriting bug introduced in Python 3.7.14, 3.8.14, 3.9.14,
+      and 3.10.6 that could cause some `domain_remap` requests to be routed to
+      the wrong object.
+
+    * Fixed a server error when attempting to access data in a deleted
+      container that had an erasure-coded storage policy.
+
+    * Improved error messages to clients that encounter errors using the
+      `formpost` middleware.
+
+    * Removed some inappropriate error-suppression when locking account and
+      container databases.
+
+    * Improved server start-up time when using multiple workers.
+
+    * Removed some unnecessary locking when logging.
+
+    * Added some basic object-metadata validation; invalid diskfiles will be
+      quarantined via the auditor or reconstructor.
+
+    * Enhanced logging when error-limiting a backend node.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.30.0, OpenStack Zed)
+
+    * Sharding improvements
+
+      * The `swift-manage-shard-ranges` tool has a new mode to repair gaps
+        in the namespace.
+
+      * Misplaced tombstone records are now properly cleaved.
+
+      * Fixed a bug where the sharder could fail to find a device to use for
+        cleaving.
+
+      * Databases marked deleted are now processed by the sharder.
+
+      * More information is now synced to the fresh database when sharding.
+        Previously, a database could lose the fact that it had been marked
+        as deleted.
+
+      * Shard ranges with no rows to cleave could previously be left in the
+        CREATED state after cleaving. Now, they are advanced to CLEAVED.
+
+      * Metrics are now emitted for whether databases used for cleaving
+        were created or already existed, allowing a better understanding
+        of the reason for handoffs in the cluster.
+
+      * Misplaced-record stats are now also emitted to statsd. Previously,
+        these were only available in logs.
+
+    * S3 API improvements
+
+      * Constant-time string comparisons are now used when checking signatures.
+
+      * Fixed cross-policy object copies. Previously, copied data would
+        always be written using the source container's policy. Now, the
+        destination container's policy will be used, avoiding availability
+        issues and unnecessary container-reconciler work.
+
+      * More headers are now copied from multi-part upload markers to their
+        completed objects, including `Content-Encoding`.
+
+      * When running with `s3_acl` disabled, `bucket-owner-full-control` and
+        `bucket-owner-read` canned ACLs will be translated to the same Swift
+        ACLs as `private`.
+
+      * The S3 ACL and Delete Multiple APIs are now less case-sensitive.
+
+      * Improved the error message when deleting a bucket that's ever had
+        versioning enabled and still has versions in it.
+
+      * `LastModified` timestamps in listings are now rounded up to whole
+        seconds, like they are in responses from AWS.
+
+      * Proxy logging for Complete Multipart Upload requests is now more
+        consistent when requests have been retried.
+
+    * Logging improvements
+
+      * Signal handling is more consistently logged at notice level.
+        Previously, signal handling would sometimes be logged at info
+        or error levels.
+
+      * The message template for proxy logging may now include a
+        `{domain}` field for the client-provided `Host` header.
+
+      * The object-replicator now logs successful rsync transfers at debug
+        instead of info.
+
+      * Added a `log_rsync_transfers` option to the object-replicator.
+        Set it to false to disable logging rsync "send" lines; during
+        large rebalances, such logging can overwhelm log aggregation
+        while providing little useful information.
+
+      * Transaction IDs are now only included in daemon log lines
+        in a request/response context.
+
+    * Fixed a socket leak when clients try to delete a non-SLO as though
+      it were a Static Large Object.
+
+    * The formpost digest algorithm is now configurable via the new
+      `allowed_digests` option, and support is added for both SHA-256
+      and SHA-512. Supported formpost digests are exposed to clients in
+      `/info`. Additionally, formpost signatures can now be base64 encoded.
+
+    * Added metrics to the formpost and tempurl middlewares to monitor
+      digest usage in signatures.
+
+    * SHA-1 signatures are now deprecated for the formpost and tempurl
+      middlewares. At some point in the future, SHA-1 will no longer be
+      enabled by default; eventually, support for it will be removed
+      entirely.
+
+    * Improved compatibility with certain FIPS-mode-enabled systems.
+
+    * Added a `ring_ip` option for various object services. This may be
+      used to find own devices in the ring in a containerized environment
+      where the `bind_ip` may not appear in the ring at all.
+
+    * Account and container replicators can now be configured with a
+      `handoff_delete` option, similar to object replicators and
+      reconstructors. See the sample config for more information.
+
+    * Developers using Swift's memcache client may now opt in to having
+      a `MemcacheConnectionError` be raised when no connection succeeded
+      using a new `raise_on_error` keyword argument to `get`/`set`.
+
+    * The tempurl middleware has been updated to return a 503 if storing a
+      token in memcache fails. Third party authentication middlewares are
+      encouraged to also use the new `raise_on_error` keyword argument
+      when storing ephemeral tokens in memcache.
+
+    * Pickle support has been removed from Swift's memcache client. Support
+      had been deprecated since Swift 1.7.0.
+
+    * Device names are now included in new database IDs. This provides more
+      context when examining incoming/outgoing sync tables or sharding
+      CleaveContexts.
+
+    * Database replication connections are now closed following an error
+      or timeout. This prevents a traceback in some cases when the replicator
+      tries to reuse the connection.
+
+    * `ENOENT` and `ENODATA` errors are better handled in the object
+      replicator and auditor.
+
+    * Improved object update throughput by shifting some shard range
+      filtering from Python to SQL.
+
+    * Include `Vary: Origin` header when CORS responses vary by origin.
+
+    * The staticweb middleware now allows empty listings at the root of
+      a container. Previously, this would result in a 404 response.
+
+    * Ring builder output tables better display weights over 1000.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.29.1, OpenStack Yoga)
+
+    * This is the final stable branch that will support Python 2.7.
+
+    * Fixed s3v4 signature calculation when the client sends an un-encoded
+      path in the request.
+
+    * Fixed multiple issues in s3api involving Multipart Uploads with
+      non-ASCII names.
+
+    * The object-updater now defers rate-limited updates to the end of its
+      cycle; these deferred updates will be processed (at the limited rate)
+      until the configured `interval` elapses. A new `max_deferred_updates`
+      option may be used to bound the deferral queue.
+
+    * Empty account and container partition directories are now cleaned up
+      immediately after replication, rather than needing to wait for an
+      additional replication cycle.
+
+    * The object-expirer now only cleans up empty containers. Previously, it
+      would attempt to delete all processed containers, regardless of whether
+      there were entries which were skipped or had errors.
+
+    * A new `item_size_warning_threshold` option may be used to monitor for
+      values that are approaching the limit of what can be stored in memcache.
+      See the memcache sample config for more information.
+
+    * Internal clients now correctly use their configured User-Agent in
+      backend requests, rather than only using it for logging.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.29.0)
+
+    * S3 API improvements
+
+      * CORS preflights are now allowed for pre-signed URLs.
+
+      * The `storage_domain` option now accepts a comma-separated list of
+        storage domains. This allows multiple storage domains to configured
+        for use with virtual-host style addressing.
+
+      * Fixed the types of configured values in /info response.
+
+      * Fixed a server error when trying to copy objects with non-ASCII names.
+
+      * Fixed a server error when uploading objects with very long names.
+        A KeyTooLongError is now returned.
+
+      * Fixed an error when multi-deleting MPUs when SLO async-deletes
+        are enabled.
+
+      * Fixed an error that allowed list-uploads and list-parts requests to
+        return incomplete or out-of-order results.
+
+      * Fixed several bugs when dealing with non-ASCII object names and
+        multipart uploads.
+
+      * Reduced the overhead of retrieving bucket and object ACLs.
+
+    * Replication, reconstruction, and diskfile improvements
+
+      * The reconstructor now uses the replication network to fetch fragments
+        for reconstruction.
+
+      * Added the ability to limit how many objects per handoff partition
+        will be reverted in a reconstructor cycle using the new
+        `max_objects_per_revert` option. This may be useful to reduce
+        ssync timeouts and lock contention, ensuring that progress is made
+        during rebalances.
+
+      * Ensure that non-durable data and .meta files are purged from handoffs
+        after syncing.
+
+      * Fixed tracebacks when there's a race to mark a file durable or delete it.
+
+      * Improved cooperative multitasking during ssync.
+
+      * Upon detecting a ring change, the reconstructor now only aborts the
+        jobs for that ring and continues processing jobs for other rings.
+
+      * Fixed a traceback when logging about a lock timeout in the replicator.
+
+    * Object updater improvements
+
+      * Added the ability to ratelimit updates (approximately) per-container
+        using the new `max_objects_per_container_per_second` option. This may
+        be used to limit requests to already-overloaded containers while still
+        making progress on updates to other containers.
+
+      * Added timing stats by response code.
+
+      * Updates are now sent over the replication network.
+
+      * Fixed a race condition where swift would attempt to quarantine
+        recently-deleted updates.
+
+    * Memcache improvements
+
+      * Added the ability to configure a chance to skip checking memcache when
+        querying shard ranges. This allows some fraction of traffic to go to
+        disk and refresh memcache before the key ages out. Recommended values
+        for the new `container_updating_shard_ranges_skip_cache_pct` and
+        `container_listing_shard_ranges_skip_cache_pct` options are in the
+        range of 0.0 to 0.1.
+
+      * Added stats for shard range cache hits, misses, and skips.
+
+      * Improved handling of timeouts and other errors when obtaining a
+        connection to memcached.
+
+    * Recon improvements
+
+      * Added object-reconstructor stats to recon.
+
+      * Each object-server IP is now queried only once when reporting disk
+        usage. Previously, each port in the ring would be queried; when using
+        servers-per-port, this could dramatically overstate the disk capacity
+        in the cluster.
+
+    * Fixed a security issue where tempurl and s3api signatures were logged in
+      full. This allowed an attacker with access to log data to perform replay
+      attacks, potentially accessing or overwriting cluster data. Now, such
+      signatures are redacted in a manner similar to auth tokens; see the
+      `reveal_sensitive_prefix` option in `proxy-server.conf`.
+
+      See CVE-2017-8761 for more information.
+
+    * Added a new `swift.common.registry` module. This includes helper
+      functions `register_sensitive_header` and `register_sensitive_param`
+      which third party middleware authors may use to flag headers and query
+      parameters for redaction when logging. For more information, see
+      https://docs.openstack.org/swift/latest/misc.html#module-swift.common.registry
+
+    * Added the ability to configure project-scope read-only roles for
+      keystoneauth using the new `project_reader_roles` option.
+
+    * The cname_lookup middleware now works with dnspython 2.0 and later.
+
+    * The internal clients used by the container-reconciler, container-sharder,
+      container-sync, and object-expirer daemons now use a more-descriptive
+      `<daemon>-ic` log name, rather than `swift`. If you previously
+      configured the `log_name` option in `internal-client.conf`, you must
+      now use the `set log_name = <value>` syntax to configure it, even if
+      no value is set in the `[DEFAULT]` section. This may be done prior to
+      upgrading.
+
+    * Fixed a bug that allowed some statsd metrics to be annotated with the
+      wrong backend layer.
+
+    * The `StatsdClient.set_prefix` method is now deprecated and
+      may be removed in a future release; by extension, so is the
+      `LogAdapter.set_statsd_prefix` method. Middleware developers should
+      use the `statsd_tail_prefix` argument to `get_logger` instead.
+
+    * Fixed a traceback in the account-server when there's no account
+      database on disk to receive a container update. The account-server
+      now correctly 404s.
+
+    * The container-updater will quarantine container databases if all
+      replicas for the account respond 404.
+
+    * Fixed a proxy-server error when the read-only middleware tried to
+      handle non-Swift paths (such as may be used by third-party middleware).
+
+    * Some client behaviors that the proxy previously logged at warning have
+      been lowered to info.
+
+    * Removed translations from most logging.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.28.0, OpenStack Xena)
+
+    * Sharding improvements:
+
+      * When building a listing from shards, any failure to retrieve
+        listings will result in a 503 response. Previously, failures
+        fetching a partiucular shard would result in a gap in listings.
+
+      * Container-server logs now include the shard path in the referer
+        field when receiving stat updates.
+
+      * Added a new config option, `rows_per_shard`, to specify how many
+        objects should be in each shard when scanning for ranges. The default
+        is `shard_container_threshold / 2`, preserving existing behavior.
+
+      * Added a new config option, `minimum_shard_size`. When scanning
+        for shard ranges, if the final shard would otherwise contain
+        fewer than this many objects, the previous shard will instead
+        be expanded to the end of the namespace (and so may contain up
+        to `rows_per_shard + minimum_shard_size` objects). This reduces
+        the number of small shards generated. The default value is
+        `rows_per_shard / 5`.
+
+      * Added a new config option, `shrink_threshold`, to specify the
+        absolute size below which a shard will be considered for shrinking.
+        This overrides the `shard_shrink_point` configuration option, which
+        expressed this as a percentage of `shard_container_threshold`.
+        `shard_shrink_point` is now deprecated.
+
+      * Similar to above, `expansion_limit` was added as an absolute-size
+        replacement for the now-deprecated `shard_shrink_merge_point`
+        configuration option.
+
+      * The sharder now correctly identifies and fails audits for shard
+        ranges that overlap exactly.
+
+      * The sharder and swift-manage-shard-ranges now consider total row
+        count (instead of just object count) when deciding whether a shard
+        is a candidate for shrinking.
+
+      * If the sharder encounters shard range gaps while cleaving, it will
+        now log an error and halt sharding progress. Previously, rows may
+        not have been moved properly, leading to data loss.
+
+      * Sharding cycle time and last-completion time are now available via
+        swift-recon.
+
+      * Fixed an issue where resolving overlapping shard ranges via shrinking
+        could prematurely mark created or cleaved shards as active.
+
+    * `swift-manage-shard-ranges` improvements:
+
+      * Exit codes are now applied more consistently:
+
+          - 0 for success
+          - 1 for an unexpected outcome
+          - 2 for invalid options
+          - 3 for user exit
+
+        As a result, some errors that previously resulted in exit code 2
+        will now exit with code 1.
+
+      * Added a new 'repair' command to automatically identify and
+        optionally resolve overlapping shard ranges.
+
+      * Added a new 'analyze' command to automatically identify overlapping
+        shard ranges and recommend a resolution based on a JSON listing
+        of shard ranges such as produced by the 'show' command.
+
+      * Added a `--includes` option for the 'show' command to only output
+        shard ranges that may include a given object name.
+
+      * Added a `--dry-run` option for the 'compact' command.
+
+      * The 'compact' command now outputs the total number of compactible
+        sequences.
+
+    * S3 API improvements:
+
+      * Added an option, `ratelimit_as_client_error`, to return 429s for
+        rate-limited responses. Several clients/SDKs have seem to support
+        retries with backoffs on 429, and having it as a client error
+        cleans up logging and metrics. By default, Swift will respond 503,
+        matching AWS documentation.
+
+      * Fixed a server error in bucket listings when `s3_acl` is enabled
+        and staticweb is configured for the container.
+
+      * Fixed a server error when a client exceeds `client_timeout` during an
+        upload. Now, a `RequestTimeout` error is correctly returned.
+
+      * Fixed a server error when downloading multipart uploads/static large
+        objects that have missing or inaccessible segments. This is a state
+        that cannot arise in AWS, so a new `BrokenMPU` error is returned,
+        indicating that retrying the request is unlikely to succeed.
+
+      * Fixed several issues with the prefix, marker, and delimiter
+        parameters that would be mirrored back to clients when listing
+        buckets.
+
+    * Partition power increase improvements:
+
+      * The relinker now spawns multiple subprocesses to process disks
+        in parallel. By default, one worker is spawned per disk; use the
+        new `--workers` option to control how many subprocesses are used.
+        Use `--workers=0` to maintain the previous behavior.
+
+      * The relinker now performs eventlet-hub selection the same way as
+        other daemons. In particular, `epolls` will no longer be selected,
+        as it seemed to cause occassional hangs.
+
+      * The relinker can now target specific storage policies or
+        partitions by using the new `--policy` and `--partition`
+        options.
+
+      * Partitions that encountered errors during relinking are no longer
+        marked as completed in the relinker state file. This ensures that
+        a subsequent relink will retry the failed partitions.
+
+      * Partition cleanup is more robust, decreasing the likelihood of
+        leaving behind mostly-empty partitions from the old partition
+        power.
+
+      * Improved relinker progress logging, and started collecting
+        progress information for swift-recon.
+
+      * Cleanup is more robust to files and directories being deleted by
+        another process.
+
+      * The relinker better handles data found from earlier partition power
+        increases.
+
+      * The relinker better handles tombstones found for the same object
+        but with different inodes.
+
+      * The reconciler now defers working on policies that have a partition
+        power increase in progress to avoid issues with concurrent writes.
+
+    * Erasure coding fixes:
+
+      * Added the ability to quarantine EC fragments that have no (or few)
+        other fragments in the cluster. A new configuration option,
+        `quarantine_threshold`, in the reconstructor controls the point at
+        the fragment will be quarantined; the default (0) will never
+        quarantine. Only fragments older than `quarantine_age` (default:
+        `reclaim_age`) may be quarantined. Before quarantining, the
+        reconstructor will attempt to fetch fragments from handoff nodes
+        in addition to the usual primary nodes; a new `request_node_count`
+        option (default `2 * replicas`) limits the total number of nodes to
+        contact.
+
+      * Added a delay before deleting non-durable data. A new configuration
+        option, `commit_window` in the `[DEFAULT]` section of
+        object-server.conf, adjusts this delay; the default is 60 seconds. This
+        improves the durability of both back-dated PUTs (from the reconciler or
+        container-sync, for example) and fresh writes to handoffs by preventing
+        the reconstructor from deleting data that the object-server was still
+        writing.
+
+      * Improved proxy-server and object-reconstructor logging when data
+        cannot be reconstructed.
+
+      * Fixed an issue where some but not all fragments having metadata
+        applied could prevent reconstruction of missing fragments.
+
+      * Server-side copying of erasure-coded data to a replicated policy no
+        longer copies EC sysmeta. The previous behavior had no material
+        effect, but could confuse operators examining data on disk.
+
+    * Python 3 fixes:
+
+      * Fixed a server error when performing a PUT authorized via
+        tempurl with some proxy pipelines.
+
+      * Fixed a server error during GET of a symlink with some proxy
+        pipelines.
+
+      * Fixed an issue with logging setup when /dev/log doesn't exist
+        or is not a UNIX socket.
+
+    * The container-reconciler now scales out better with new `processes`,
+      `process`, and `concurrency` options, similar to the object-expirer.
+
+    * The dark-data audit watcher now skips objects younger than a new
+      configurable `grace_age` period. This avoids issues where data
+      could be flagged, quarantined, or deleted because of listing
+      consistency issues. The default is one week.
+
+    * The dark-data audit watcher now requires that all primary locations
+      for an object's container agree that the data does not appear in
+      listings to consider data "dark". Previously, a network partition
+      that left an object node isolated could cause it to quarantine or
+      delete all of its data.
+
+    * More daemons now support systemd notify sockets.
+
+    * `EPIPE` errors no longer log tracebacks.
+
+    * The account and container auditors now log and update recon before
+      going to sleep.
+
+    * The object-expirer logs fewer client disconnects.
+
+    * `swift-recon-cron` now includes the last time it was run in the recon
+      information.
+
+    * `EIO` errors during read now cause object diskfiles to be quarantined.
+
+    * The formpost middleware now properly supports uploading multiple files
+      with different content-types.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.27.0, OpenStack Wallaby)
+
+    * Added "audit watcher" hooks to allow operators to run arbitrary code
+      against every diskfile in a cluster. For more information, see
+      https://docs.openstack.org/swift/latest/development_watchers.html
+
+    * Added support for system-scoped "reader" roles when authenticating using
+      Keystone. Operators may configure this using the `system_reader_roles`
+      option in the `[filter:keystoneauth]` section of their proxy-server.conf.
+
+      A comparable group, `.reseller_reader`, is now available for development
+      purposes when authenticating using tempauth.
+
+    * Allow static large object segments to be deleted asynchronously.
+      Operators may opt into this new behavior by enabling the new
+      `allow_async_delete` option in the `[filter:slo]` section
+      in their proxy-server.conf. For more information, see
+      https://docs.openstack.org/swift/latest/overview_large_objects.html#deleting-a-large-object
+
+    * Added the ability to connect to memcached over TLS. See the
+      `tls_*` options in etc/memcache.conf-sample
+
+    * The proxy-server now caches 'listing' shards, improving listing
+      performance for sharded containers. A new config option,
+      `recheck_listing_shard_ranges`, controls the cache time and defaults to
+      10 minutes; set it to 0 to disable caching (the previous behavior).
+
+    * Added a new optional proxy-logging field `{wire_status_int}` for the
+      status code returned to the client. For more information, see
+      https://docs.openstack.org/swift/latest/logs.html#proxy-logs
+
+    * Errors downloading a Static Large Object that cause a shorter-than-expected
+      response are now logged as 500s.
+
+    * Memcache client error-limiting is now configurable. See the
+      `error_suppression_*` options in etc/memcache.conf-sample
+
+    * Added `tasks_per_second` option to rate-limit the object-expirer.
+
+    * Added `usedforsecurity` annotations for use on FIPS-compliant systems.
+
+    * Added an option to write EC fragments with legacy CRC to ensure a smooth
+      upgrade from liberasurecode<=1.5.0 to >=1.6.2. For more information, see
+      https://bugs.launchpad.net/liberasurecode/+bug/1886088
+
+    * **Known Issue**: Operators should verify that encryption is not enabled
+      in their reconciler pipelines; having it enabled there may harm data
+      durability. For more information, see https://launchpad.net/bugs/1910804
+
+    * S3 API improvements:
+
+      * Fixed a bug that prevented the s3api pipeline validation described in
+        proxy-server.conf-sample from being performed. As documented, operators
+        can disable this via the `auth_pipeline_check` option if proxy startup
+        fails with validation errors.
+
+      * Make allowable clock skew configurable, with a default value of
+        15 minutes to match AWS. Note that this was previously hardcoded at
+        5 minutes; operators may want to preserve the prior behavior by setting
+        `allowable_clock_skew = 300` in the `[filter:s3api]` section of their
+        proxy-server.conf.
+
+      * Fixed an issue where SHA mismatches in client XML payloads would cause
+        a server error. Swift now correctly responds with a client error about
+        the bad digest.
+
+      * Fixed an issue where non-base64 signatures would cause a server error.
+        Swift now correctly responds with a client error about the invalid
+        digest.
+
+      * Container ACLs are now cloned to the `+segments` container when it is
+        created.
+
+      * The correct storage policy is now logged for S3 requests.
+
+      * Added the ability to configure auth region in s3token middleware.
+
+      * CORS-related headers are now passed through appropriately when using
+        the S3 API. Note that allowed origins and other container metadata
+        must still be configured through the Swift API as documented at
+        https://docs.openstack.org/swift/latest/cors.html
+
+        Preflight requests do not contain enough information to map a
+        bucket to an account/container pair; a new cluster-wide option
+        `cors_preflight_allow_origin` may be configured for such OPTIONS
+        requests. The default (blank) rejects all S3 preflight requests.
+
+    * Sharding improvements:
+
+      * Prevent shard databases from losing track of their root database when
+        deleted.
+
+      * Prevent sharded root databases from being reclaimed to ensure that
+        shards can detect that they have been deleted.
+
+      * A `--no-auto-shard` option has been added to `swift-container-sharder`.
+
+      * The sharder daemon has been enhanced to better support the shrinking
+        of shards that are no longer required. Shard containers will now
+        discover from their root container if they should be shrinking. They
+        will also discover the shards into which they should shrink, which may
+        include the root container itself.
+
+      * A 'compact' command has been added to `swift-manage-shard-ranges` that
+        enables sequences of contiguous shards with low object counts to be
+        compacted into another existing shard, or into the root container.
+
+      * `swift-manage-shard-ranges` can now accept a config file; this
+        may be used to ensure consistency of threshold values with the
+        container-sharder config.
+
+      * Overlapping shrinking shards no longer generate audit warnings; these
+        are expected to sometimes overlap.
+
+      * The sharding progress reports in recon cache now continue to be included
+        for a period of time after sharding has completed. The time period
+        may be configured using the `recon_sharded_timeout` option in the
+        `[container-sharder]` section of container-server.conf, and defaults
+        to 12 hours.
+
+      * Add root containers with compactible ranges to recon cache.
+
+      * Expose sharding statistics in the backend recon middleware.
+
+    * Replication improvements:
+
+      * Fixed a race condition in ssync that could lead to a loss of data
+        durability (or even loss of data, for two-replica policies) when some
+        object servers have outdated rings. Replication via rsync is likely
+        still affected by a similar bug.
+
+      * Non-durable fragments can now be reverted from handoffs.
+
+      * The post-rsync REPLICATE call no longer recalculates hashes immediately.
+
+      * Hashes are no longer invalidated after a successful ssync; they were
+        already invalidated during the data transfer.
+
+      * Reduced log noise for common ssync errors.
+
+    * Python 3 fixes:
+
+      * Added support for Python 3.9.
+
+      * Staticweb correctly handles listings when paths include non-ASCII
+        characters.
+
+      * S3 API now allows multipart uploads with non-ASCII characters in the
+        object name.
+
+      * Fixed an import-ordering issue in `swift-dispersion-populate`.
+
+    * Partition power increase improvements:
+
+      * Fixed a bug where stale state files would cause misplaced data during
+        multiple partition power increases.
+
+      * Removed a race condition that could cause newly-written data to not be
+        linked into the new partition for the new partition power.
+
+      * Improved safety during cleanup to ensure files have been relinked
+        appropriately before unlinking.
+
+      * Added an option to drop privileges when running the relinker as root.
+
+      * Added an option to rate-limit how quickly data files are relinked or
+        cleaned up. This may be used to reduce I/O load during partition power
+        increases, improving end-user performance.
+
+      * Rehash partitions during the partition power increase. Previously, we
+        relied on the replication engine to perform the rehash, which could
+        cause an unexpected I/O spike after a partition power increase.
+
+      * Warn when relinking/cleaning up and any disks are unmounted.
+
+      * Log progress per partition when relinking/cleaning up.
+
+      * During clean-up, stop warning about tombstones that got reaped from
+        the new location but not the old.
+
+      * Added the ability to read options from object-server.conf, similar to
+        background daemons.
+
+    * Turned off thread-logging when monkey-patching with eventlet. This
+      addresses a potential hang in the proxy-server while logging client
+      disconnects.
+
+    * Fixed a bug that could cause EC GET responses to return a server error.
+
+    * Fixed an issue with `swift-drive-audit` when run around New Year's.
+
+    * Server errors encountered when validating the first segment of a Static or
+      Dynamic Large Object now return a 503 to the client, rather than a 409.
+
+    * Errors when setting keys in memcached are now logged. This helps
+      operators detect when shard ranges for caching have gotten too large to
+      be stored, for example.
+
+    * Various other minor bug fixes and improvements.
+
+
+swift (2.26.0, OpenStack Victoria)
+
+    * Extend concurrent reads to erasure coded policies. Previously, the
+      options `concurrent_gets` and `concurrency_timeout` only applied to
+      replicated policies.
+
+    * Add a new `concurrent_ec_extra_requests` option to allow the proxy to
+      make some extra backend requests immediately. The proxy will respond as
+      soon as there are enough responses available to reconstruct.
+
+    * The concurrent read options (`concurrent_gets`, `concurrency_timeout`,
+      and `concurrent_ec_extra_requests`) may now be configured per
+      storage-policy.
+
+    * Replication servers can now handle all request methods. This allows
+      ssync to work with a separate replication network.
+
+    * All background daemons now use the replication network. This allows
+      better isolation between external, client-facing traffic and internal,
+      background traffic. Note that during a rolling upgrade, replication
+      servers may respond with `405 Method Not Allowed`. To avoid this,
+      operators should remove the config option `replication_server = true`
+      from their replication servers; this will allow them to handle all
+      request methods before upgrading.
+
+    * S3 API improvements:
+
+      * Fixed some SignatureDoesNotMatch errors when using the AWS .NET SDK.
+
+      * Add basic read support for object tagging. This improves
+        compatibility with AWS CLI version 2. Write support is not
+        yet implemented, so the tag set will always be empty.
+
+      * CompleteMultipartUpload requests may now be safely retried.
+
+      * Improved quota-exceeded error messages.
+
+      * Improved logging and statsd metrics. Be aware that this will cause
+        an increase in the proxy-logging statsd metrics emited for S3
+        responses. However, this should more accurately reflect the state
+        of the system.
+
+      * S3 requests are now less demanding on the container layer.
+
+    * Python 3 bug fixes:
+
+      * Fixed an error when reading encrypted data that was written while
+        running Python 2 for a path that includes non-ASCII characters. This
+        was caused by a difference in string types that resulted in
+        ambiguity when decrypting. To prevent the ambiguity for new data, set
+        `meta_version_to_write = 3` in your keymaster configuration after
+        upgrading all proxy servers.
+
+        If upgrading from Swift 2.20.0 or Swift 2.19.1 or earlier, set
+        `meta_version_to_write = 1` in your keymaster configuration prior
+        to upgrading.
+
+      * Object expiration respects the `expiring_objects_container_divisor`
+        config option.
+
+      * `fallocate_reserve` may be specified as a percentage in more places.
+
+      * The ETag-quoting middleware no longer raises TypeErrors.
+
+    * Sharding improvements:
+
+      * Prevent object updates from auto-creating shard containers. This
+        ensures more consistent listings for sharded containers during
+        rebalances.
+
+      * Deleted shard containers are no longer considered root containers.
+        This prevents unnecessary sharding audit failures and allows the
+        deleted shard database to actually be unlinked.
+
+      * `swift-container-info` now summarizes shard range information.
+        Pass `-v`/`--verbose` if you want to see all of them.
+
+      * Improved container-sharder stat reporting to reduce load on root
+        container databases.
+
+      * Don't inject shard ranges when user quits.
+
+    * Servers now open one listen socket per worker, ensuring each worker
+      serves roughly the same number of concurrent connections.
+
+    * Server workers may now be gracefully terminated via `SIGHUP` or
+      `SIGUSR1`. The parent process will then spawn a fresh worker.
+
+    * During rebalances, clients should no longer get 404s for data that
+      exists but whose replicas are overloaded.
+
+    * Improved cache management for account and container responses.
+
+    * Allow proxy-logging middlewares to be configured more independently.
+
+    * Allow operators to pass either raw or URL-quoted paths to
+      swift-get-nodes. Notably, this allows swift-get-nodes to work with
+      the reserved namespace used for object versioning.
+
+    * Container read ACLs now work with object versioning. This only
+      allows access to the most-recent version via an unversioned URL.
+
+    * Improved how containers reclaim deleted rows to reduce locking and object
+      update throughput.
+
+    * Large object reads log fewer client disconnects.
+
+    * Allow ratelimit to be placed multiple times in a proxy pipeline,
+      such as both before s3api and auth (to handle swift requests without
+      needing to make an auth decision) and after (to limit S3 requests).
+
+    * Shuffle object-updater work. This somewhat reduces the impact a
+      single overloaded database has on other containers' listings.
+
+    * Fix a proxy-server error when retrieving erasure coded data when
+      there are durable fragments but not enough to reconstruct.
+
+    * Fix an error in the proxy server when finalizing data.
+
+    * Improve performance when increasing partition power.
+
+    * Various other minor bug fixes and improvements.
+
+
 swift (2.25.0, OpenStack Ussuri)
 
     * WSGI server processes can now notify systemd when they are ready.
@@ -1018,7 +1995,7 @@ swift (2.15.0)
 
     * Add support to increase object ring partition power transparently
       to end users and with no cluster downtime. Increasing the ring
-      part power allows for incremental adjustment to the upper bound
+      partition power allows for incremental adjustment to the upper bound
       of the cluster size. Please review the full docs at
       <https://docs.openstack.org/swift/latest/ring_partpower.html>.
 

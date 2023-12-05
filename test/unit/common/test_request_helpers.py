@@ -42,6 +42,70 @@ class TestRequestHelpers(unittest.TestCase):
             rh.constrain_req_limit(req, 10)
         self.assertEqual(raised.exception.status_int, 412)
 
+    def test_validate_params(self):
+        req = Request.blank('')
+        actual = rh.validate_params(req, ('limit', 'marker', 'end_marker'))
+        self.assertEqual({}, actual)
+
+        req = Request.blank('', query_string='limit=1&junk=here&marker=foo')
+        actual = rh.validate_params(req, ())
+        self.assertEqual({}, actual)
+
+        req = Request.blank('', query_string='limit=1&junk=here&marker=foo')
+        actual = rh.validate_params(req, ('limit', 'marker', 'end_marker'))
+        expected = {'limit': '1', 'marker': 'foo'}
+        self.assertEqual(expected, actual)
+
+        req = Request.blank('', query_string='limit=1&junk=here&marker=')
+        actual = rh.validate_params(req, ('limit', 'marker', 'end_marker'))
+        expected = {'limit': '1', 'marker': ''}
+        self.assertEqual(expected, actual)
+
+        # ignore bad junk
+        req = Request.blank('', query_string='limit=1&junk=%ff&marker=foo')
+        actual = rh.validate_params(req, ('limit', 'marker', 'end_marker'))
+        expected = {'limit': '1', 'marker': 'foo'}
+        self.assertEqual(expected, actual)
+
+        # error on bad wanted parameter
+        req = Request.blank('', query_string='limit=1&junk=here&marker=%ff')
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_params(req, ('limit', 'marker', 'end_marker'))
+        self.assertEqual(raised.exception.status_int, 400)
+
+    def test_validate_container_params(self):
+        req = Request.blank('')
+        actual = rh.validate_container_params(req)
+        self.assertEqual({'limit': 10000}, actual)
+
+        req = Request.blank('', query_string='limit=1&junk=here&marker=foo')
+        actual = rh.validate_container_params(req)
+        expected = {'limit': 1, 'marker': 'foo'}
+        self.assertEqual(expected, actual)
+
+        req = Request.blank('', query_string='limit=1&junk=here&marker=')
+        actual = rh.validate_container_params(req)
+        expected = {'limit': 1, 'marker': ''}
+        self.assertEqual(expected, actual)
+
+        # ignore bad junk
+        req = Request.blank('', query_string='limit=1&junk=%ff&marker=foo')
+        actual = rh.validate_container_params(req)
+        expected = {'limit': 1, 'marker': 'foo'}
+        self.assertEqual(expected, actual)
+
+        # error on bad wanted parameter
+        req = Request.blank('', query_string='limit=1&junk=here&marker=%ff')
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_container_params(req)
+        self.assertEqual(raised.exception.status_int, 400)
+
+        # error on bad limit
+        req = Request.blank('', query_string='limit=10001')
+        with self.assertRaises(HTTPException) as raised:
+            rh.validate_container_params(req)
+        self.assertEqual(raised.exception.status_int, 412)
+
     def test_is_user_meta(self):
         m_type = 'meta'
         for st in server_types:
@@ -123,6 +187,45 @@ class TestRequestHelpers(unittest.TestCase):
         self.assertEqual(to_req.headers['A'], 'b')
         self.assertFalse('c' in to_req.headers)
         self.assertFalse('C' in to_req.headers)
+
+    def test_is_use_replication_network(self):
+        self.assertFalse(rh.is_use_replication_network())
+        self.assertFalse(rh.is_use_replication_network({}))
+        self.assertFalse(rh.is_use_replication_network(
+            {'x-backend-use-replication-network': 'false'}))
+        self.assertFalse(rh.is_use_replication_network(
+            {'x-backend-use-replication-network': 'no'}))
+
+        self.assertTrue(rh.is_use_replication_network(
+            {'x-backend-use-replication-network': 'true'}))
+        self.assertTrue(rh.is_use_replication_network(
+            {'x-backend-use-replication-network': 'yes'}))
+        self.assertTrue(rh.is_use_replication_network(
+            {'X-Backend-Use-Replication-Network': 'True'}))
+
+    def test_get_ip_port(self):
+        node = {
+            'ip': '1.2.3.4',
+            'port': 6000,
+            'replication_ip': '5.6.7.8',
+            'replication_port': 7000,
+        }
+        self.assertEqual(('1.2.3.4', 6000), rh.get_ip_port(node, {}))
+        self.assertEqual(('5.6.7.8', 7000), rh.get_ip_port(node, {
+            rh.USE_REPLICATION_NETWORK_HEADER: 'true'}))
+        self.assertEqual(('1.2.3.4', 6000), rh.get_ip_port(node, {
+            rh.USE_REPLICATION_NETWORK_HEADER: 'false'}))
+
+        # node trumps absent header and False header
+        node['use_replication'] = True
+        self.assertEqual(('5.6.7.8', 7000), rh.get_ip_port(node, {}))
+        self.assertEqual(('5.6.7.8', 7000), rh.get_ip_port(node, {
+            rh.USE_REPLICATION_NETWORK_HEADER: 'false'}))
+
+        # True header trumps node
+        node['use_replication'] = False
+        self.assertEqual(('5.6.7.8', 7000), rh.get_ip_port(node, {
+            rh.USE_REPLICATION_NETWORK_HEADER: 'true'}))
 
     @patch_policies(with_ec_default=True)
     def test_get_name_and_placement_object_req(self):

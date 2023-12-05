@@ -33,10 +33,10 @@ from swift.common.utils import Timestamp, encode_timestamps, ShardRange, \
     get_db_files, make_db_file_path
 from swift.common.storage_policy import POLICIES
 
+from test.debug_logger import debug_logger
 from test.unit.common import test_db_replicator
 from test.unit import patch_policies, make_timestamp_iter, mock_check_drive, \
-    debug_logger, EMPTY_ETAG, FakeLogger, attach_fake_replication_rpc, \
-    FakeHTTPResponse
+    EMPTY_ETAG, attach_fake_replication_rpc, FakeHTTPResponse
 from contextlib import contextmanager
 
 
@@ -883,6 +883,10 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         daemon = self._run_once(node)
         # push to remote, and third node was missing (also maybe reconciler)
         self.assertTrue(2 < daemon.stats['rsync'] <= 3, daemon.stats['rsync'])
+        self.assertEqual(
+            1, self.logger.get_stats_counts().get('reconciler_db_created'))
+        self.assertFalse(
+            self.logger.get_stats_counts().get('reconciler_db_exists'))
 
         # grab the rsynced instance of remote_broker
         remote_broker = self._get_broker('a', 'c', node_index=1)
@@ -902,7 +906,12 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
 
         # and we should have also enqueued these rows in a single reconciler,
         # since we forced the object timestamps to be in the same hour.
+        self.logger.clear()
         reconciler = daemon.get_reconciler_broker(misplaced[0]['created_at'])
+        self.assertFalse(
+            self.logger.get_stats_counts().get('reconciler_db_created'))
+        self.assertEqual(
+            1, self.logger.get_stats_counts().get('reconciler_db_exists'))
         # but it may not be on the same node as us anymore though...
         reconciler = self._get_broker(reconciler.account,
                                       reconciler.container, node_index=0)
@@ -1429,7 +1438,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         remote_broker.initialize(put_timestamp, POLICIES.default.idx)
 
         def check_replicate(expected_shard_ranges, from_broker, to_broker):
-            daemon = replicator.ContainerReplicator({}, logger=FakeLogger())
+            daemon = replicator.ContainerReplicator({}, logger=debug_logger())
             part, node = self._get_broker_part_node(to_broker)
             info = broker.get_replication_info()
             success = daemon._repl_to_node(node, from_broker, part, info)
@@ -1593,7 +1602,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         part, node = self._get_broker_part_node(remote_broker)
         info = broker.get_replication_info()
         daemon = replicator.ContainerReplicator({})
-        daemon.logger = FakeLogger()
+        daemon.logger = debug_logger()
         success = daemon._repl_to_node(node, broker, part, info)
         self.assertFalse(success)
         # broker only has its own shard range so expect objects to be sync'd
@@ -1630,7 +1639,7 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         db_replicator.ReplConnection = fake_repl_connection
         part, node = self._get_broker_part_node(remote_broker)
         daemon = replicator.ContainerReplicator({'node_timeout': '0.001'})
-        daemon.logger = FakeLogger()
+        daemon.logger = debug_logger()
         with mock.patch.object(daemon.ring, 'get_part_nodes',
                                return_value=[node]), \
                 mock.patch.object(daemon, '_post_replicate_hook'):
@@ -2634,6 +2643,75 @@ class TestReplicatorSync(test_db_replicator.TestReplicatorSync):
         self.assertEqual(local_broker.get_info()['id'],
                          os.path.basename(rsync_calls[0][1]))
         self.assertFalse(rsync_calls[1:])
+
+    @mock.patch('swift.common.ring.ring.Ring.get_part_nodes', return_value=[])
+    def test_find_local_handoff_for_part(self, mock_part_nodes):
+
+        with mock.patch(
+                'swift.common.db_replicator.ring.Ring',
+                return_value=self._ring):
+            daemon = replicator.ContainerReplicator({}, logger=self.logger)
+
+        # First let's assume we find a primary node
+        ring_node1, ring_node2, ring_node3 = daemon.ring.devs[-3:]
+        mock_part_nodes.return_value = [ring_node1, ring_node2]
+        daemon._local_device_ids = {ring_node1['id']: ring_node1,
+                                    ring_node3['id']: ring_node3}
+        node = daemon.find_local_handoff_for_part(0)
+        self.assertEqual(node['id'], ring_node1['id'])
+
+        # And if we can't find one from the primaries get *some* local device
+        mock_part_nodes.return_value = []
+        daemon._local_device_ids = {ring_node3['id']: ring_node3}
+        node = daemon.find_local_handoff_for_part(0)
+        self.assertEqual(node['id'], ring_node3['id'])
+
+        # if there are more then 1 local_dev_id it'll randomly pick one, but
+        # not a zero-weight device
+        ring_node3['weight'] = 0
+        selected_node_ids = set()
+        local_dev_ids = {dev['id']: dev for dev in daemon.ring.devs[-3:]}
+        daemon._local_device_ids = local_dev_ids
+        for _ in range(15):
+            node = daemon.find_local_handoff_for_part(0)
+            self.assertIn(node['id'], local_dev_ids)
+            selected_node_ids.add(node['id'])
+            if len(selected_node_ids) == 3:
+                break  # unexpected
+        self.assertEqual(len(selected_node_ids), 2)
+        self.assertEqual([1, 1], [local_dev_ids[dev_id]['weight']
+                                  for dev_id in selected_node_ids])
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertFalse(warning_lines)
+
+        # ...unless all devices have zero-weight
+        ring_node3['weight'] = 0
+        ring_node2['weight'] = 0
+        selected_node_ids = set()
+        local_dev_ids = {dev['id']: dev for dev in daemon.ring.devs[-2:]}
+        daemon._local_device_ids = local_dev_ids
+        for _ in range(15):
+            self.logger.clear()
+            node = daemon.find_local_handoff_for_part(0)
+            self.assertIn(node['id'], local_dev_ids)
+            selected_node_ids.add(node['id'])
+            if len(selected_node_ids) == 2:
+                break  # expected
+        self.assertEqual(len(selected_node_ids), 2)
+        self.assertEqual([0, 0], [local_dev_ids[dev_id]['weight']
+                                  for dev_id in selected_node_ids])
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines), warning_lines)
+        self.assertIn(
+            'Could not find a non-zero weight device for handoff partition',
+            warning_lines[0])
+
+        # If there are also no local_dev_ids, then we'll get the RuntimeError
+        daemon._local_device_ids = {}
+        with self.assertRaises(RuntimeError) as dev_err:
+            daemon.find_local_handoff_for_part(0)
+        expected_error_string = 'Cannot find local handoff; no local devices'
+        self.assertEqual(str(dev_err.exception), expected_error_string)
 
 
 if __name__ == '__main__':

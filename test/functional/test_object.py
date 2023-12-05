@@ -16,19 +16,20 @@
 # limitations under the License.
 
 import datetime
-import hashlib
 import json
 import unittest
 from uuid import uuid4
 import time
+from unittest import SkipTest
 from xml.dom import minidom
 
 import six
 from six.moves import range
 
 from test.functional import check_response, retry, requires_acls, \
-    requires_policies, SkipTest, requires_bulk
+    requires_policies, requires_bulk
 import test.functional as tf
+from swift.common.utils import md5
 
 
 def setUpModule():
@@ -941,7 +942,7 @@ class TestObject(unittest.TestCase):
     @requires_acls
     def test_read_only(self):
         if tf.skip3:
-            raise tf.SkipTest
+            raise SkipTest
 
         def get_listing(url, token, parsed, conn):
             conn.request('GET', '%s/%s' % (parsed.path, self.container), '',
@@ -1542,7 +1543,7 @@ class TestObject(unittest.TestCase):
         def put_obj(url, token, parsed, conn, obj):
             conn.request(
                 'PUT', '%s/%s/%s' % (parsed.path, self.container, obj),
-                'test', {'X-Auth-Token': token})
+                'test', {'X-Auth-Token': token, 'X-Object-Meta-Color': 'red'})
             return check_response(conn)
 
         def check_cors(url, token, parsed, conn,
@@ -1576,6 +1577,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        # Just a pre-flight; this doesn't show up yet
+        self.assertNotIn('access-control-expose-headers', headers)
 
         resp = retry(check_cors,
                      'GET', 'cat', {'Origin': 'http://m.com'})
@@ -1583,6 +1586,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        self.assertIn('x-object-meta-color', headers.get(
+            'access-control-expose-headers').split(', '))
 
         resp = retry(check_cors,
                      'GET', 'cat', {'Origin': 'http://m.com',
@@ -1591,6 +1596,8 @@ class TestObject(unittest.TestCase):
         headers = dict((k.lower(), v) for k, v in resp.getheaders())
         self.assertEqual(headers.get('access-control-allow-origin'),
                          '*')
+        self.assertIn('x-object-meta-color', headers.get(
+            'access-control-expose-headers').split(', '))
 
         ####################
 
@@ -1741,7 +1748,7 @@ class TestObject(unittest.TestCase):
                 expect_quoted = tf.cluster_info.get('etag_quoter', {}).get(
                     'enable_by_default', False)
 
-            expected_etag = hashlib.md5(b'test').hexdigest()
+            expected_etag = md5(b'test', usedforsecurity=False).hexdigest()
             if expect_quoted:
                 expected_etag = '"%s"' % expected_etag
             self.assertEqual(resp.headers['etag'], expected_etag)

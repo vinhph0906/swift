@@ -23,12 +23,13 @@ from copy import deepcopy
 import six
 from six.moves import urllib
 from time import time, strftime, gmtime
+from unittest import SkipTest
 
 import test.functional as tf
 from swift.common.middleware import tempurl
 from test.functional import cluster_info
 from test.functional.tests import Utils, Base, Base2, BaseEnv
-from test.functional import requires_acls, SkipTest
+from test.functional import requires_acls
 from test.functional.swift_test_client import Account, Connection, \
     ResponseError
 
@@ -90,7 +91,7 @@ class TestTempurlEnv(TestTempurlBaseEnv):
 
 class TestTempurl(Base):
     env = TestTempurlEnv
-    digest_name = 'sha1'
+    digest_name = 'sha256'
 
     def setUp(self):
         super(TestTempurl, self).setUp()
@@ -102,6 +103,8 @@ class TestTempurl(Base):
                 "Expected tempurl_enabled to be True/False, got %r" %
                 (self.env.tempurl_enabled,))
 
+        # N.B. The default to 'sha1' in case the info has nothing is for
+        # extremely old clusters, which presumably use SHA1.
         if self.digest_name not in cluster_info['tempurl'].get(
                 'allowed_digests', ['sha1']):
             raise SkipTest("tempurl does not support %s signatures" %
@@ -461,7 +464,7 @@ class TestContainerTempurlEnv(BaseEnv):
 
 class TestContainerTempurl(Base):
     env = TestContainerTempurlEnv
-    digest_name = 'sha1'
+    digest_name = 'sha256'
 
     def setUp(self):
         super(TestContainerTempurl, self).setUp()
@@ -736,7 +739,7 @@ class TestSloTempurlEnv(TestTempurlBaseEnv):
 
 class TestSloTempurl(Base):
     env = TestSloTempurlEnv
-    digest_name = 'sha1'
+    digest_name = 'sha256'
 
     def setUp(self):
         super(TestSloTempurl, self).setUp()
@@ -802,6 +805,16 @@ def requires_digest(digest):
 class TestTempurlAlgorithms(Base):
     env = TestTempurlEnv
 
+    def setUp(self):
+        super(TestTempurlAlgorithms, self).setUp()
+        if self.env.tempurl_enabled is False:
+            raise SkipTest("TempURL not enabled")
+        elif self.env.tempurl_enabled is not True:
+            # just some sanity checking
+            raise Exception(
+                "Expected tempurl_enabled to be True/False, got %r" %
+                (self.env.tempurl_enabled,))
+
     def get_sig(self, expires, digest, encoding):
         path = urllib.parse.unquote(self.env.conn.make_path(self.env.obj.path))
         if six.PY2:
@@ -828,7 +841,7 @@ class TestTempurlAlgorithms(Base):
         else:
             raise ValueError('Unrecognized encoding: %r' % encoding)
 
-    def _do_test(self, digest, encoding, expect_failure=False):
+    def _do_test(self, digest, encoding):
         expires = int(time()) + 86400
         sig = self.get_sig(expires, digest, encoding)
 
@@ -840,24 +853,14 @@ class TestTempurlAlgorithms(Base):
 
         parms = {'temp_url_sig': sig, 'temp_url_expires': str(expires)}
 
-        if expect_failure:
-            with self.assertRaises(ResponseError):
-                self.env.obj.read(parms=parms, cfg={'no_auth_token': True})
-            self.assert_status([401])
+        contents = self.env.obj.read(
+            parms=parms,
+            cfg={'no_auth_token': True})
+        self.assertEqual(contents, b"obj contents")
 
-            # ditto for HEADs
-            with self.assertRaises(ResponseError):
-                self.env.obj.info(parms=parms, cfg={'no_auth_token': True})
-            self.assert_status([401])
-        else:
-            contents = self.env.obj.read(
-                parms=parms,
-                cfg={'no_auth_token': True})
-            self.assertEqual(contents, b"obj contents")
-
-            # GET tempurls also allow HEAD requests
-            self.assertTrue(self.env.obj.info(
-                parms=parms, cfg={'no_auth_token': True}))
+        # GET tempurls also allow HEAD requests
+        self.assertTrue(self.env.obj.info(
+            parms=parms, cfg={'no_auth_token': True}))
 
     @requires_digest('sha1')
     def test_sha1(self):
@@ -877,8 +880,7 @@ class TestTempurlAlgorithms(Base):
 
     @requires_digest('sha512')
     def test_sha512(self):
-        # 128 chars seems awfully long for a signature -- let's require base64
-        self._do_test('sha512', 'hex', expect_failure=True)
+        self._do_test('sha512', 'hex')
         self._do_test('sha512', 'base64')
         self._do_test('sha512', 'base64-no-padding')
         self._do_test('sha512', 'url-safe-base64')

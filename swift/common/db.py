@@ -17,7 +17,6 @@
 
 from contextlib import contextmanager, closing
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -36,7 +35,7 @@ import sqlite3
 from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
     check_utf8
 from swift.common.utils import Timestamp, renamer, \
-    mkdirs, lock_parent_directory, fallocate
+    mkdirs, lock_parent_directory, fallocate, md5
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPBadRequest
 
@@ -186,7 +185,8 @@ def chexor(old, name, timestamp):
     """
     if name is None:
         raise Exception('name is None!')
-    new = hashlib.md5(('%s-%s' % (name, timestamp)).encode('utf8')).hexdigest()
+    new = md5(('%s-%s' % (name, timestamp)).encode('utf8'),
+              usedforsecurity=False).hexdigest()
     return '%032x' % (int(old, 16) ^ int(new, 16))
 
 
@@ -205,7 +205,7 @@ def get_db_connection(path, timeout=30, logger=None, okay_to_create=False):
                                factory=GreenDBConnection, timeout=timeout)
         if QUERY_LOGGING and logger and not six.PY2:
             conn.set_trace_callback(logger.debug)
-        if path != ':memory:' and not okay_to_create:
+        if not okay_to_create:
             # attempt to detect and fail when connect creates the db file
             stat = os.stat(path)
             if stat.st_size == 0 and stat.st_ctime >= connect_time:
@@ -227,8 +227,86 @@ def get_db_connection(path, timeout=30, logger=None, okay_to_create=False):
     return conn
 
 
+class TombstoneReclaimer(object):
+    """Encapsulates reclamation of deleted rows in a database."""
+    def __init__(self, broker, age_timestamp):
+        """
+        Encapsulates reclamation of deleted rows in a database.
+
+        :param broker: an instance of :class:`~swift.common.db.DatabaseBroker`.
+        :param age_timestamp: a float timestamp: tombstones older than this
+            time will be deleted.
+        """
+        self.broker = broker
+        self.age_timestamp = age_timestamp
+        self.marker = ''
+        self.remaining_tombstones = self.reclaimed = 0
+        self.finished = False
+        # limit 1 offset N gives back the N+1th matching row; that row is used
+        # as an exclusive end_marker for a batch of deletes, so a batch
+        # comprises rows satisfying self.marker <= name < end_marker.
+        self.batch_query = '''
+            SELECT name FROM %s WHERE deleted = 1
+            AND name >= ?
+            ORDER BY NAME LIMIT 1 OFFSET ?
+        ''' % self.broker.db_contains_type
+        self.clean_batch_query = '''
+            DELETE FROM %s WHERE deleted = 1
+            AND name >= ? AND %s < %s
+        ''' % (self.broker.db_contains_type, self.broker.db_reclaim_timestamp,
+               self.age_timestamp)
+
+    def _reclaim(self, conn):
+        curs = conn.execute(self.batch_query, (self.marker, RECLAIM_PAGE_SIZE))
+        row = curs.fetchone()
+        end_marker = row[0] if row else ''
+        if end_marker:
+            # do a single book-ended DELETE and bounce out
+            curs = conn.execute(self.clean_batch_query + ' AND name < ?',
+                                (self.marker, end_marker))
+            self.marker = end_marker
+            self.reclaimed += curs.rowcount
+            self.remaining_tombstones += RECLAIM_PAGE_SIZE - curs.rowcount
+        else:
+            # delete off the end
+            curs = conn.execute(self.clean_batch_query, (self.marker,))
+            self.finished = True
+            self.reclaimed += curs.rowcount
+
+    def reclaim(self):
+        """
+        Perform reclaim of deleted rows older than ``age_timestamp``.
+        """
+        while not self.finished:
+            with self.broker.get() as conn:
+                self._reclaim(conn)
+                conn.commit()
+
+    def get_tombstone_count(self):
+        """
+        Return the number of remaining tombstones newer than ``age_timestamp``.
+        Executes the ``reclaim`` method if it has not already been called on
+        this instance.
+
+        :return: The number of tombstones in the ``broker`` that are newer than
+            ``age_timestamp``.
+        """
+        if not self.finished:
+            self.reclaim()
+        with self.broker.get() as conn:
+            curs = conn.execute('''
+                SELECT COUNT(*) FROM %s WHERE deleted = 1
+                AND name >= ?
+            ''' % (self.broker.db_contains_type,), (self.marker,))
+        tombstones = curs.fetchone()[0]
+        self.remaining_tombstones += tombstones
+        return self.remaining_tombstones
+
+
 class DatabaseBroker(object):
     """Encapsulates working with a database."""
+
+    delete_meta_whitelist = []
 
     def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
                  account=None, container=None, pending_timeout=None,
@@ -281,17 +359,13 @@ class DatabaseBroker(object):
         :param put_timestamp: internalized timestamp of initial PUT request
         :param storage_policy_index: only required for containers
         """
-        if self._db_file == ':memory:':
-            tmp_db_file = None
-            conn = get_db_connection(self._db_file, self.timeout, self.logger)
-        else:
-            mkdirs(self.db_dir)
-            fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
-            os.close(fd)
-            conn = sqlite3.connect(tmp_db_file, check_same_thread=False,
-                                   factory=GreenDBConnection, timeout=0)
-            if QUERY_LOGGING and not six.PY2:
-                conn.set_trace_callback(self.logger.debug)
+        mkdirs(self.db_dir)
+        fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
+        os.close(fd)
+        conn = sqlite3.connect(tmp_db_file, check_same_thread=False,
+                               factory=GreenDBConnection, timeout=0)
+        if QUERY_LOGGING and not six.PY2:
+            conn.set_trace_callback(self.logger.debug)
         # creating dbs implicitly does a lot of transactions, so we
         # pick fast, unsafe options here and do a big fsync at the end.
         with closing(conn.cursor()) as cur:
@@ -366,6 +440,8 @@ class DatabaseBroker(object):
         # first, clear the metadata
         cleared_meta = {}
         for k in self.metadata:
+            if k.lower() in self.delete_meta_whitelist:
+                continue
             cleared_meta[k] = ('', timestamp)
         self.update_metadata(cleared_meta)
         # then mark the db as deleted
@@ -461,7 +537,7 @@ class DatabaseBroker(object):
     def get(self):
         """Use with the "with" statement; returns a database connection."""
         if not self.conn:
-            if self.db_file != ':memory:' and os.path.exists(self.db_file):
+            if os.path.exists(self.db_file):
                 try:
                     self.conn = get_db_connection(self.db_file, self.timeout,
                                                   self.logger)
@@ -489,7 +565,7 @@ class DatabaseBroker(object):
     def lock(self):
         """Use with the "with" statement; locks a database."""
         if not self.conn:
-            if self.db_file != ':memory:' and os.path.exists(self.db_file):
+            if os.path.exists(self.db_file):
                 self.conn = get_db_connection(self.db_file, self.timeout,
                                               self.logger)
             else:
@@ -501,16 +577,19 @@ class DatabaseBroker(object):
         conn.execute('BEGIN IMMEDIATE')
         try:
             yield True
-        except (Exception, Timeout):
-            pass
-        try:
-            conn.execute('ROLLBACK')
-            conn.isolation_level = orig_isolation_level
-            self.conn = conn
-        except (Exception, Timeout):
-            logging.exception(
-                _('Broker error trying to rollback locked connection'))
-            conn.close()
+        finally:
+            try:
+                conn.execute('ROLLBACK')
+                conn.isolation_level = orig_isolation_level
+                self.conn = conn
+            except (Exception, Timeout):
+                logging.exception(
+                    _('Broker error trying to rollback locked connection'))
+                conn.close()
+
+    def _new_db_id(self):
+        device_name = os.path.basename(self.get_device_path())
+        return "%s-%s" % (str(uuid4()), device_name)
 
     def newid(self, remote_id):
         """
@@ -521,7 +600,7 @@ class DatabaseBroker(object):
         with self.get() as conn:
             row = conn.execute('''
                 UPDATE %s_stat SET id=?
-            ''' % self.db_type, (str(uuid4()),))
+            ''' % self.db_type, (self._new_db_id(),))
             row = conn.execute('''
                 SELECT ROWID FROM %s ORDER BY ROWID DESC LIMIT 1
             ''' % self.db_contains_type).fetchone()
@@ -553,7 +632,7 @@ class DatabaseBroker(object):
 
         :returns: True if the DB is considered to be deleted, False otherwise
         """
-        if self.db_file != ':memory:' and not os.path.exists(self.db_file):
+        if not os.path.exists(self.db_file):
             return True
         self._commit_puts_stale_ok()
         with self.get() as conn:
@@ -686,8 +765,8 @@ class DatabaseBroker(object):
         """
         Put a record into the DB. If the DB has an associated pending file with
         space then the record is appended to that file and a commit to the DB
-        is deferred. If the DB is in-memory or its pending file is full then
-        the record will be committed immediately.
+        is deferred. If its pending file is full then the record will be
+        committed immediately.
 
         :param record: a record to be added to the DB.
         :raises DatabaseConnectionError: if the DB file does not exist or if
@@ -695,9 +774,6 @@ class DatabaseBroker(object):
         :raises LockTimeout: if a timeout occurs while waiting to take a lock
             to write to the pending file.
         """
-        if self._db_file == ':memory:':
-            self.merge_items([record])
-            return
         if not os.path.exists(self.db_file):
             raise DatabaseConnectionError(self.db_file, "DB doesn't exist")
         if self.skip_commits:
@@ -723,8 +799,7 @@ class DatabaseBroker(object):
                     fp.flush()
 
     def _skip_commit_puts(self):
-        return (self._db_file == ':memory:' or self.skip_commits or not
-                os.path.exists(self.pending_file))
+        return self.skip_commits or not os.path.exists(self.pending_file)
 
     def _commit_puts(self, item_list=None):
         """
@@ -838,7 +913,7 @@ class DatabaseBroker(object):
         within 512k of a boundary, it allocates to the next boundary.
         Boundaries are 2m, 5m, 10m, 25m, 50m, then every 50m after.
         """
-        if not DB_PREALLOCATION or self._db_file == ':memory:':
+        if not DB_PREALLOCATION:
             return
         MB = (1024 * 1024)
 
@@ -984,46 +1059,21 @@ class DatabaseBroker(object):
             with lock_parent_directory(self.pending_file,
                                        self.pending_timeout):
                 self._commit_puts()
-        marker = ''
-        finished = False
-        while not finished:
-            with self.get() as conn:
-                marker = self._reclaim(conn, age_timestamp, marker)
-                if not marker:
-                    finished = True
-                    self._reclaim_other_stuff(
-                        conn, age_timestamp, sync_timestamp)
-                conn.commit()
+
+        tombstone_reclaimer = TombstoneReclaimer(self, age_timestamp)
+        tombstone_reclaimer.reclaim()
+        with self.get() as conn:
+            self._reclaim_other_stuff(conn, age_timestamp, sync_timestamp)
+            conn.commit()
+        return tombstone_reclaimer
 
     def _reclaim_other_stuff(self, conn, age_timestamp, sync_timestamp):
         """
-        This is only called once at the end of reclaim after _reclaim has been
-        called for each page.
+        This is only called once at the end of reclaim after tombstone reclaim
+        has been completed.
         """
         self._reclaim_sync(conn, sync_timestamp)
         self._reclaim_metadata(conn, age_timestamp)
-
-    def _reclaim(self, conn, age_timestamp, marker):
-        clean_batch_qry = '''
-            DELETE FROM %s WHERE deleted = 1
-            AND name > ? AND %s < ?
-        ''' % (self.db_contains_type, self.db_reclaim_timestamp)
-        curs = conn.execute('''
-            SELECT name FROM %s WHERE deleted = 1
-            AND name > ?
-            ORDER BY NAME LIMIT 1 OFFSET ?
-        ''' % (self.db_contains_type,), (marker, RECLAIM_PAGE_SIZE))
-        row = curs.fetchone()
-        if row:
-            # do a single book-ended DELETE and bounce out
-            end_marker = row[0]
-            conn.execute(clean_batch_qry + ' AND name <= ?', (
-                marker, age_timestamp, end_marker))
-        else:
-            # delete off the end and reset marker to indicate we're done
-            end_marker = ''
-            conn.execute(clean_batch_qry, (marker, age_timestamp))
-        return end_marker
 
     def _reclaim_sync(self, conn, sync_timestamp):
         try:

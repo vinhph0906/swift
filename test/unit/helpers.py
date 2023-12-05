@@ -25,7 +25,7 @@ from contextlib import closing
 from gzip import GzipFile
 from tempfile import mkdtemp
 import time
-
+import warnings
 
 from eventlet import spawn, wsgi
 import mock
@@ -40,15 +40,16 @@ from swift.common.storage_policy import StoragePolicy, ECStoragePolicy
 from swift.common.middleware import listing_formats, proxy_logging
 from swift.common import utils
 from swift.common.utils import mkdirs, normalize_timestamp, NullLogger
-from swift.common.wsgi import SwiftHttpProtocol
+from swift.common.http_protocol import SwiftHttpProtocol
 from swift.container import server as container_server
 from swift.obj import server as object_server
 from swift.proxy import server as proxy_server
 import swift.proxy.controllers.obj
 
 from test import listen_zero
-from test.unit import write_fake_ring, DEFAULT_TEST_EC_TYPE, debug_logger, \
-    connect_tcp, readuntil2crlfs
+from test.debug_logger import debug_logger
+from test.unit import write_fake_ring, DEFAULT_TEST_EC_TYPE, connect_tcp, \
+    readuntil2crlfs
 
 
 def setup_servers(the_object_server=object_server, extra_conf=None):
@@ -214,6 +215,10 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
     logging_prosv = proxy_logging.ProxyLoggingMiddleware(
         listing_formats.ListingFilter(prosrv, {}, logger=prosrv.logger),
         conf, logger=prosrv.logger)
+    # Yes, eventlet, we know -- we have to support bad clients, though
+    warnings.filterwarnings(
+        'ignore', module='eventlet',
+        message='capitalize_response_headers is disabled')
     prospa = spawn(wsgi.server, prolis, logging_prosv, nl,
                    protocol=SwiftHttpProtocol,
                    capitalize_response_headers=False)

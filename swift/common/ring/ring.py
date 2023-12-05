@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import array
+import contextlib
+
 import six.moves.cPickle as pickle
 import json
 from collections import defaultdict
@@ -22,20 +24,25 @@ from os.path import getmtime
 import struct
 from time import time
 import os
-from hashlib import md5
 from itertools import chain, count
 from tempfile import NamedTemporaryFile
 import sys
 import zlib
 
+import six
 from six.moves import range
 
 from swift.common.exceptions import RingLoadError
-from swift.common.utils import hash_path, validate_configuration
+from swift.common.utils import hash_path, validate_configuration, md5
 from swift.common.ring.utils import tiers_for_dev
 
 
+DEFAULT_RELOAD_TIME = 15
+
+
 def calc_replica_count(replica2part2dev_id):
+    if not replica2part2dev_id:
+        return 0
     base = len(replica2part2dev_id) - 1
     extra = 1.0 * len(replica2part2dev_id[-1]) / len(replica2part2dev_id[0])
     return base + extra
@@ -52,7 +59,7 @@ class RingReader(object):
         self._buffer = b''
         self.size = 0
         self.raw_size = 0
-        self._md5 = md5()
+        self._md5 = md5(usedforsecurity=False)
         self._decomp = zlib.decompressobj(32 + zlib.MAX_WBITS)
 
     @property
@@ -171,22 +178,21 @@ class RingData(object):
         :param bool metadata_only: If True, only load `devs` and `part_shift`.
         :returns: A RingData instance containing the loaded data.
         """
-        gz_file = RingReader(filename)
-
-        # See if the file is in the new format
-        magic = gz_file.read(4)
-        if magic == b'R1NG':
-            format_version, = struct.unpack('!H', gz_file.read(2))
-            if format_version == 1:
-                ring_data = cls.deserialize_v1(
-                    gz_file, metadata_only=metadata_only)
+        with contextlib.closing(RingReader(filename)) as gz_file:
+            # See if the file is in the new format
+            magic = gz_file.read(4)
+            if magic == b'R1NG':
+                format_version, = struct.unpack('!H', gz_file.read(2))
+                if format_version == 1:
+                    ring_data = cls.deserialize_v1(
+                        gz_file, metadata_only=metadata_only)
+                else:
+                    raise Exception('Unknown ring format version %d' %
+                                    format_version)
             else:
-                raise Exception('Unknown ring format version %d' %
-                                format_version)
-        else:
-            # Assume old-style pickled ring
-            gz_file.seek(0)
-            ring_data = pickle.load(gz_file)
+                # Assume old-style pickled ring
+                gz_file.seek(0)
+                ring_data = pickle.load(gz_file)
 
         if not hasattr(ring_data, 'devs'):
             ring_data = RingData(ring_data['replica2part2dev_id'],
@@ -221,7 +227,12 @@ class RingData(object):
         file_obj.write(struct.pack('!I', json_len))
         file_obj.write(json_text)
         for part2dev_id in ring['replica2part2dev_id']:
-            file_obj.write(part2dev_id.tostring())
+            if six.PY2:
+                # Can't just use tofile() because a GzipFile apparently
+                # doesn't count as an 'open file'
+                file_obj.write(part2dev_id.tostring())
+            else:
+                part2dev_id.tofile(file_obj)
 
     def save(self, filename, mtime=1300507380.0):
         """
@@ -264,7 +275,7 @@ class Ring(object):
     :raises RingLoadError: if the loaded ring data violates its constraint
     """
 
-    def __init__(self, serialized_path, reload_time=15, ring_name=None,
+    def __init__(self, serialized_path, reload_time=None, ring_name=None,
                  validation_hook=lambda ring_data: None):
         # can't use the ring unless HASH_PATH_SUFFIX is set
         validate_configuration()
@@ -273,7 +284,8 @@ class Ring(object):
                                                 ring_name + '.ring.gz')
         else:
             self.serialized_path = os.path.join(serialized_path)
-        self.reload_time = reload_time
+        self.reload_time = (DEFAULT_RELOAD_TIME if reload_time is None
+                            else reload_time)
         self._validation_hook = validation_hook
         self._reload(force=True)
 
@@ -354,6 +366,8 @@ class Ring(object):
 
     @property
     def next_part_power(self):
+        if time() > self._rtime:
+            self._reload()
         return self._next_part_power
 
     @property
@@ -532,7 +546,8 @@ class Ring(object):
             (d['region'], d['zone'], d['ip']) for d in primary_nodes)
 
         parts = len(self._replica2part2dev_id[0])
-        part_hash = md5(str(part).encode('ascii')).digest()
+        part_hash = md5(str(part).encode('ascii'),
+                        usedforsecurity=False).digest()
         start = struct.unpack_from('>I', part_hash)[0] >> self._part_shift
         inc = int(parts / 65536) or 1
         # Multiple loops for execution speed; the checks and bookkeeping get

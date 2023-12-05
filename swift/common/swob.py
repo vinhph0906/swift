@@ -35,7 +35,11 @@ place to keep Swift working every time webob decides some interface
 needs to change.
 """
 
-from collections import defaultdict, MutableMapping
+from collections import defaultdict
+try:
+    from collections.abc import MutableMapping
+except ImportError:
+    from collections import MutableMapping  # py2
 import time
 from functools import partial
 from datetime import datetime
@@ -110,6 +114,8 @@ RESPONSE_REASONS = {
           'backend server.'),
     507: ('Insufficient Storage', 'There was not enough space to save the '
           'resource. Drive: %(drive)s'),
+    529: ('Too Many Backend Requests', 'The server is incapable of performing '
+          'the requested operation due to too many requests. Slow down.')
 }
 
 MAX_RANGE_OVERLAPS = 2
@@ -1615,3 +1621,4 @@ HTTPNotImplemented = status_map[501]
 HTTPBadGateway = status_map[502]
 HTTPServiceUnavailable = status_map[503]
 HTTPInsufficientStorage = status_map[507]
+HTTPTooManyBackendRequests = status_map[529]

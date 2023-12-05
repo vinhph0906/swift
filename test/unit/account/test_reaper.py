@@ -29,6 +29,7 @@ from swift.common.exceptions import ClientException
 from swift.common.utils import normalize_timestamp, Timestamp
 
 from test import unit
+from test.debug_logger import debug_logger
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
@@ -208,7 +209,7 @@ class TestReaper(unittest.TestCase):
         r = reaper.AccountReaper(conf)
         r.myips = myips
         if fakelogger:
-            r.logger = unit.debug_logger('test-reaper')
+            r.logger = debug_logger('test-reaper')
         return r
 
     def fake_reap_account(self, *args, **kwargs):
@@ -302,7 +303,7 @@ class TestReaper(unittest.TestCase):
         conf = {
             'mount_check': 'false',
         }
-        r = reaper.AccountReaper(conf, logger=unit.debug_logger())
+        r = reaper.AccountReaper(conf, logger=debug_logger())
         mock_path = 'swift.account.reaper.direct_delete_object'
         for policy in POLICIES:
             r.reset_stats()
@@ -322,7 +323,8 @@ class TestReaper(unittest.TestCase):
                             'X-Container-Partition': 'partition',
                             'X-Container-Device': device,
                             'X-Backend-Storage-Policy-Index': policy.idx,
-                            'X-Timestamp': '1429117638.86767'
+                            'X-Timestamp': '1429117638.86767',
+                            'x-backend-use-replication-network': 'true',
                         }
                         ring = r.get_object_ring(policy.idx)
                         expected = call(dict(ring.devs[i], index=i), 0,
@@ -442,7 +444,8 @@ class TestReaper(unittest.TestCase):
                     'X-Account-Partition': 'partition',
                     'X-Account-Device': device,
                     'X-Account-Override-Deleted': 'yes',
-                    'X-Timestamp': '1429117639.67676'
+                    'X-Timestamp': '1429117639.67676',
+                    'x-backend-use-replication-network': 'true',
                 }
                 ring = r.get_object_ring(policy.idx)
                 expected = call(dict(ring.devs[i], index=i), 0, 'a', 'c',
@@ -564,7 +567,7 @@ class TestReaper(unittest.TestCase):
 
     def test_reap_account(self):
         containers = ('c1', 'c2', 'c3', 'c4')
-        broker = FakeAccountBroker(containers, unit.FakeLogger())
+        broker = FakeAccountBroker(containers, debug_logger())
         self.called_amount = 0
         self.r = r = self.init_reaper({}, fakelogger=True)
         r.start_time = time.time()
@@ -600,7 +603,7 @@ class TestReaper(unittest.TestCase):
         self.assertEqual(len(self.r.account_ring.devs), 3)
 
     def test_reap_account_no_container(self):
-        broker = FakeAccountBroker(tuple(), unit.FakeLogger())
+        broker = FakeAccountBroker(tuple(), debug_logger())
         self.r = r = self.init_reaper({}, fakelogger=True)
         self.called_amount = 0
         r.start_time = time.time()
@@ -737,7 +740,7 @@ class TestReaper(unittest.TestCase):
             container_reaped[0] += 1
 
         fake_ring = FakeRing()
-        fake_logger = unit.FakeLogger()
+        fake_logger = debug_logger()
         with patch('swift.account.reaper.AccountBroker',
                    FakeAccountBroker), \
                 patch(
@@ -802,7 +805,7 @@ class TestReaper(unittest.TestCase):
         self.assertFalse(foo.called)
 
         with patch('swift.account.reaper.AccountReaper.reap_device') as foo:
-            r.logger = unit.debug_logger('test-reaper')
+            r.logger = debug_logger('test-reaper')
             r.devices = 'thisdeviceisbad'
             r.run_once()
         self.assertTrue(r.logger.get_lines_for_level(

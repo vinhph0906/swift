@@ -144,6 +144,7 @@ https://github.com/swiftstack/s3compat in detail.
 from cgi import parse_header
 import json
 from paste.deploy import loadwsgi
+from six.moves.urllib.parse import parse_qs
 
 from swift.common.constraints import valid_api_version
 from swift.common.middleware.listing_formats import \
@@ -155,16 +156,20 @@ from swift.common.middleware.s3api.exception import NotS3Request, \
 from swift.common.middleware.s3api.s3request import get_request_class
 from swift.common.middleware.s3api.s3response import ErrorResponse, \
     InternalError, MethodNotAllowed, S3ResponseBase, S3NotImplemented
-from swift.common.utils import get_logger, register_swift_info, \
-    config_true_value, config_positive_int_value, split_path, \
-    closing_if_possible
+from swift.common.utils import get_logger, config_true_value, \
+    config_positive_int_value, split_path, closing_if_possible, list_from_csv
 from swift.common.middleware.s3api.utils import Config
 from swift.common.middleware.s3api.acl_handlers import get_acl_handler
+from swift.common.registry import register_swift_info, \
+    register_sensitive_header, register_sensitive_param
 
 
 class ListingEtagMiddleware(object):
     def __init__(self, app):
         self.app = app
+        # Pass this along so get_container_info will have the configured
+        # odds to skip cache
+        self._pipeline_final_app = app._pipeline_final_app
 
     def __call__(self, env, start_response):
         # a lot of this is cribbed from listing_formats / swob.Request
@@ -242,53 +247,101 @@ class ListingEtagMiddleware(object):
 
 class S3ApiMiddleware(object):
     """S3Api: S3 compatibility middleware"""
-    def __init__(self, app, conf, *args, **kwargs):
+    def __init__(self, app, wsgi_conf, *args, **kwargs):
         self.app = app
         self.conf = Config()
 
         # Set default values if they are not configured
         self.conf.allow_no_owner = config_true_value(
-            conf.get('allow_no_owner', False))
-        self.conf.location = conf.get('location', 'us-east-1')
+            wsgi_conf.get('allow_no_owner', False))
+        self.conf.location = wsgi_conf.get('location', 'us-east-1')
         self.conf.dns_compliant_bucket_names = config_true_value(
-            conf.get('dns_compliant_bucket_names', True))
+            wsgi_conf.get('dns_compliant_bucket_names', True))
         self.conf.max_bucket_listing = config_positive_int_value(
-            conf.get('max_bucket_listing', 1000))
+            wsgi_conf.get('max_bucket_listing', 1000))
         self.conf.max_parts_listing = config_positive_int_value(
-            conf.get('max_parts_listing', 1000))
+            wsgi_conf.get('max_parts_listing', 1000))
         self.conf.max_multi_delete_objects = config_positive_int_value(
-            conf.get('max_multi_delete_objects', 1000))
+            wsgi_conf.get('max_multi_delete_objects', 1000))
         self.conf.multi_delete_concurrency = config_positive_int_value(
-            conf.get('multi_delete_concurrency', 2))
+            wsgi_conf.get('multi_delete_concurrency', 2))
         self.conf.s3_acl = config_true_value(
-            conf.get('s3_acl', False))
-        self.conf.storage_domain = conf.get('storage_domain', '')
+            wsgi_conf.get('s3_acl', False))
+        self.conf.storage_domains = list_from_csv(
+            wsgi_conf.get('storage_domain', ''))
         self.conf.auth_pipeline_check = config_true_value(
-            conf.get('auth_pipeline_check', True))
+            wsgi_conf.get('auth_pipeline_check', True))
         self.conf.max_upload_part_num = config_positive_int_value(
-            conf.get('max_upload_part_num', 1000))
+            wsgi_conf.get('max_upload_part_num', 1000))
         self.conf.check_bucket_owner = config_true_value(
-            conf.get('check_bucket_owner', False))
+            wsgi_conf.get('check_bucket_owner', False))
         self.conf.force_swift_request_proxy_log = config_true_value(
-            conf.get('force_swift_request_proxy_log', False))
+            wsgi_conf.get('force_swift_request_proxy_log', False))
         self.conf.allow_multipart_uploads = config_true_value(
-            conf.get('allow_multipart_uploads', True))
+            wsgi_conf.get('allow_multipart_uploads', True))
         self.conf.min_segment_size = config_positive_int_value(
-            conf.get('min_segment_size', 5242880))
+            wsgi_conf.get('min_segment_size', 5242880))
+        self.conf.allowable_clock_skew = config_positive_int_value(
+            wsgi_conf.get('allowable_clock_skew', 15 * 60))
+        self.conf.cors_preflight_allow_origin = list_from_csv(wsgi_conf.get(
+            'cors_preflight_allow_origin', ''))
+        if '*' in self.conf.cors_preflight_allow_origin and \
+                len(self.conf.cors_preflight_allow_origin) > 1:
+            raise ValueError('if cors_preflight_allow_origin should include '
+                             'all domains, * must be the only entry')
+        self.conf.ratelimit_as_client_error = config_true_value(
+            wsgi_conf.get('ratelimit_as_client_error', False))
 
         self.logger = get_logger(
-            conf, log_route=conf.get('log_name', 's3api'))
-        self.slo_enabled = self.conf.allow_multipart_uploads
-        self.check_pipeline(self.conf)
+            wsgi_conf, log_route=wsgi_conf.get('log_name', 's3api'))
+        self.check_pipeline(wsgi_conf)
+
+    def is_s3_cors_preflight(self, env):
+        if env['REQUEST_METHOD'] != 'OPTIONS' or not env.get('HTTP_ORIGIN'):
+            # Not a CORS preflight
+            return False
+        acrh = env.get('HTTP_ACCESS_CONTROL_REQUEST_HEADERS', '').lower()
+        if 'authorization' in acrh and \
+                not env['PATH_INFO'].startswith(('/v1/', '/v1.0/')):
+            return True
+        q = parse_qs(env.get('QUERY_STRING', ''))
+        if 'AWSAccessKeyId' in q or 'X-Amz-Credential' in q:
+            return True
+        # Not S3, apparently
+        return False
 
     def __call__(self, env, start_response):
+        origin = env.get('HTTP_ORIGIN')
+        if self.conf.cors_preflight_allow_origin and \
+                self.is_s3_cors_preflight(env):
+            # I guess it's likely going to be an S3 request? *shrug*
+            if self.conf.cors_preflight_allow_origin != ['*'] and \
+                    origin not in self.conf.cors_preflight_allow_origin:
+                start_response('401 Unauthorized', [
+                    ('Allow', 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
+                ])
+                return [b'']
+
+            headers = [
+                ('Allow', 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
+                ('Access-Control-Allow-Origin', origin),
+                ('Access-Control-Allow-Methods',
+                 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
+                ('Vary', 'Origin, Access-Control-Request-Headers'),
+            ]
+            acrh = set(list_from_csv(
+                env.get('HTTP_ACCESS_CONTROL_REQUEST_HEADERS', '').lower()))
+            if acrh:
+                headers.append((
+                    'Access-Control-Allow-Headers',
+                    ', '.join(acrh)))
+
+            start_response('200 OK', headers)
+            return [b'']
+
         try:
             req_class = get_request_class(env, self.conf.s3_acl)
-            req = req_class(
-                env, self.app, self.slo_enabled, self.conf.storage_domain,
-                self.conf.location, self.conf.force_swift_request_proxy_log,
-                self.conf.dns_compliant_bucket_names,
-                self.conf.allow_multipart_uploads, self.conf.allow_no_owner)
+            req = req_class(env, self.app, self.conf)
             resp = self.handle_request(req)
         except NotS3Request:
             resp = self.app
@@ -306,6 +359,8 @@ class S3ApiMiddleware(object):
             resp.headers['x-amz-id-2'] = env['swift.trans_id']
             resp.headers['x-amz-request-id'] = env['swift.trans_id']
 
+        if 's3api.backend_path' in env and 'swift.backend_path' not in env:
+            env['swift.backend_path'] = env['s3api.backend_path']
         return resp(env, start_response)
 
     def handle_request(self, req):
@@ -332,14 +387,14 @@ class S3ApiMiddleware(object):
 
         return res
 
-    def check_pipeline(self, conf):
+    def check_pipeline(self, wsgi_conf):
         """
         Check that proxy-server.conf has an appropriate pipeline for s3api.
         """
-        if conf.get('__file__', None) is None:
+        if wsgi_conf.get('__file__', None) is None:
             return
 
-        ctx = loadcontext(loadwsgi.APP, conf.__file__)
+        ctx = loadcontext(loadwsgi.APP, wsgi_conf['__file__'])
         pipeline = str(PipelineWrapper(ctx)).split(' ')
 
         # Add compatible with 3rd party middleware.
@@ -349,13 +404,13 @@ class S3ApiMiddleware(object):
                                  pipeline.index('proxy-server')]
 
         # Check SLO middleware
-        if self.slo_enabled and 'slo' not in auth_pipeline:
-            self.slo_enabled = False
+        if self.conf.allow_multipart_uploads and 'slo' not in auth_pipeline:
+            self.conf.allow_multipart_uploads = False
             self.logger.warning('s3api middleware requires SLO middleware '
                                 'to support multi-part upload, please add it '
                                 'in pipeline')
 
-        if not conf.auth_pipeline_check:
+        if not self.conf.auth_pipeline_check:
             self.logger.debug('Skip pipeline auth check.')
             return
 
@@ -402,14 +457,20 @@ def filter_factory(global_conf, **local_conf):
     register_swift_info(
         's3api',
         # TODO: make default values as variables
-        max_bucket_listing=conf.get('max_bucket_listing', 1000),
-        max_parts_listing=conf.get('max_parts_listing', 1000),
-        max_upload_part_num=conf.get('max_upload_part_num', 1000),
-        max_multi_delete_objects=conf.get('max_multi_delete_objects', 1000),
-        allow_multipart_uploads=conf.get('allow_multipart_uploads', True),
-        min_segment_size=conf.get('min_segment_size', 5242880),
-        s3_acl=conf.get('s3_acl', False)
+        max_bucket_listing=int(conf.get('max_bucket_listing', 1000)),
+        max_parts_listing=int(conf.get('max_parts_listing', 1000)),
+        max_upload_part_num=int(conf.get('max_upload_part_num', 1000)),
+        max_multi_delete_objects=int(
+            conf.get('max_multi_delete_objects', 1000)),
+        allow_multipart_uploads=config_true_value(
+            conf.get('allow_multipart_uploads', True)),
+        min_segment_size=int(conf.get('min_segment_size', 5242880)),
+        s3_acl=config_true_value(conf.get('s3_acl', False)),
     )
+
+    register_sensitive_header('authorization')
+    register_sensitive_param('Signature')
+    register_sensitive_param('X-Amz-Signature')
 
     def s3api_filter(app):
         return S3ApiMiddleware(ListingEtagMiddleware(app), conf)

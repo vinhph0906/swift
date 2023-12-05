@@ -15,11 +15,13 @@
 
 import json
 
+from swift.common import constraints
 from swift.common.http import HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_NO_CONTENT
 from swift.common.request_helpers import update_etag_is_at_header
 from swift.common.swob import Range, content_range_header_value, \
     normalize_etag
-from swift.common.utils import public, list_from_csv, get_swift_info
+from swift.common.utils import public, list_from_csv
+from swift.common.registry import get_swift_info
 
 from swift.common.middleware.versioned_writes.object_versioning import \
     DELETE_MARKER_CONTENT_TYPE
@@ -27,7 +29,7 @@ from swift.common.middleware.s3api.utils import S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.controllers.base import Controller
 from swift.common.middleware.s3api.s3response import S3NotImplemented, \
     InvalidRange, NoSuchKey, NoSuchVersion, InvalidArgument, HTTPNoContent, \
-    PreconditionFailed
+    PreconditionFailed, KeyTooLongError
 
 
 class ObjectController(Controller):
@@ -138,6 +140,8 @@ class ObjectController(Controller):
         """
         Handle PUT Object and PUT Object (Copy) request
         """
+        if len(req.object_name) > constraints.MAX_OBJECT_NAME_LENGTH:
+            raise KeyTooLongError()
         # set X-Timestamp by s3api to use at copy resp body
         req_timestamp = S3Timestamp.now()
         req.headers['X-Timestamp'] = req_timestamp.internal

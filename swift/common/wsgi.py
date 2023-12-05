@@ -25,27 +25,27 @@ from swift import gettext_ as _
 import sys
 from textwrap import dedent
 import time
+import warnings
 
 import eventlet
 import eventlet.debug
-from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout, \
-    websocket
+from eventlet import greenio, GreenPool, sleep, wsgi, listen, Timeout
 from paste.deploy import loadwsgi
 from eventlet.green import socket, ssl, os as green_os
 from io import BytesIO
 
 import six
 from six import StringIO
-from six.moves import configparser
 
 from swift.common import utils, constraints
+from swift.common.http_protocol import SwiftHttpProtocol, \
+    SwiftHttpProxiedProtocol
 from swift.common.storage_policy import BindPortsCache
-from swift.common.swob import Request, wsgi_quote, wsgi_unquote, \
-    wsgi_quote_plus, wsgi_unquote_plus, wsgi_to_bytes, bytes_to_wsgi
+from swift.common.swob import Request, wsgi_unquote
 from swift.common.utils import capture_stdio, disable_fallocate, \
     drop_privileges, get_logger, NullLogger, config_true_value, \
     validate_configuration, get_hub, config_auto_int_value, \
-    reiterate, clean_up_daemon_hygiene, systemd_notify
+    reiterate, clean_up_daemon_hygiene, systemd_notify, NicerInterpolation
 
 SIGNUM_TO_NAME = {getattr(signal, n): n for n in dir(signal)
                   if n.startswith('SIG') and '_' not in n}
@@ -61,23 +61,6 @@ except (ImportError, NotImplementedError):
     CPU_COUNT = 1
 
 
-if not six.PY2:
-    # In general, we haven't really thought much about interpolation in
-    # configs. Python's default ConfigParser has always supported it, though,
-    # so *we* got it "for free". Unfortunatley, since we "supported"
-    # interpolation, we have to assume there are deployments in the wild that
-    # use it, and try not to break them. So, do what we can to mimic the py2
-    # behavior of passing through values like "1%" (which we want to support
-    # for fallocate_reserve).
-    class NicerInterpolation(configparser.BasicInterpolation):
-        def before_get(self, parser, section, option, value, defaults):
-            if '%(' not in value:
-                return value
-            return super(NicerInterpolation, self).before_get(
-                parser, section, option, value, defaults)
-    configparser.ConfigParser._DEFAULT_INTERPOLATION = NicerInterpolation()
-
-
 class NamedConfigLoader(loadwsgi.ConfigLoader):
     """
     Patch paste.deploy's ConfigLoader so each context object will know what
@@ -85,6 +68,8 @@ class NamedConfigLoader(loadwsgi.ConfigLoader):
     """
 
     def get_context(self, object_type, name=None, global_conf=None):
+        if not six.PY2:
+            self.parser._interpolation = NicerInterpolation()
         context = super(NamedConfigLoader, self).get_context(
             object_type, name=name, global_conf=global_conf)
         context.name = name
@@ -138,13 +123,25 @@ class ConfigString(NamedConfigLoader):
         self.filename = "string"
         defaults = {
             'here': "string",
-            '__file__': self.contents,
+            '__file__': self,
         }
         self.parser = loadwsgi.NicerConfigParser("string", defaults=defaults)
         self.parser.optionxform = str  # Don't lower-case keys
         # Defaults don't need interpolation (crazy PasteDeploy...)
         self.parser.defaults = lambda: dict(self.parser._defaults, **defaults)
-        self.parser.readfp(self.contents)
+        if six.PY2:
+            self.parser.readfp(self.contents)
+        else:
+            self.parser.read_file(self.contents)
+
+    def readline(self, *args, **kwargs):
+        return self.contents.readline(*args, **kwargs)
+
+    def seek(self, *args, **kwargs):
+        return self.contents.seek(*args, **kwargs)
+
+    def __iter__(self):
+        return iter(self.contents)
 
 
 def wrap_conf_type(f):
@@ -244,47 +241,6 @@ class RestrictedGreenPool(GreenPool):
             self.waitall()
 
 
-def pipeline_property(name, **kwargs):
-    """
-    Create a property accessor for the given name.  The property will
-    dig through the bound instance on which it was accessed for an
-    attribute "app" and check that object for an attribute of the given
-    name.  If the "app" object does not have such an attribute, it will
-    look for an attribute "app" on THAT object and continue it's search
-    from there.  If the named attribute cannot be found accessing the
-    property will raise AttributeError.
-
-    If a default kwarg is provided you get that instead of the
-    AttributeError.  When found the attribute will be cached on instance
-    with the property accessor using the same name as the attribute
-    prefixed with a leading underscore.
-    """
-
-    cache_attr_name = '_%s' % name
-
-    def getter(self):
-        cached_value = getattr(self, cache_attr_name, None)
-        if cached_value:
-            return cached_value
-        app = self  # first app is on self
-        while True:
-            app = getattr(app, 'app', None)
-            if not app:
-                break
-            try:
-                value = getattr(app, name)
-            except AttributeError:
-                continue
-            setattr(self, cache_attr_name, value)
-            return value
-        if 'default' in kwargs:
-            return kwargs['default']
-        raise AttributeError('No apps in pipeline have a '
-                             '%s attribute' % name)
-
-    return property(getter)
-
-
 class PipelineWrapper(object):
     """
     This class provides a number of utility methods for
@@ -382,29 +338,35 @@ def loadcontext(object_type, uri, name=None, relative_to=None,
                                 global_conf=global_conf)
 
 
-def _add_pipeline_properties(app, *names):
-    for property_name in names:
-        if not hasattr(app, property_name):
-            setattr(app.__class__, property_name,
-                    pipeline_property(property_name))
-
-
 def loadapp(conf_file, global_conf=None, allow_modify_pipeline=True):
     """
     Loads a context from a config file, and if the context is a pipeline
     then presents the app with the opportunity to modify the pipeline.
+
+    :param conf_file: path to a config file
+    :param global_conf: a dict of options to update the loaded config. Options
+        in ``global_conf`` will override those in ``conf_file`` except where
+        the ``conf_file`` option is preceded by ``set``.
+    :param allow_modify_pipeline: if True, and the context is a pipeline, and
+        the loaded app has a ``modify_wsgi_pipeline`` property, then that
+        property will be called before the pipeline is loaded.
+    :return: the loaded app
     """
     global_conf = global_conf or {}
     ctx = loadcontext(loadwsgi.APP, conf_file, global_conf=global_conf)
     if ctx.object_type.name == 'pipeline':
         # give app the opportunity to modify the pipeline context
-        app = ctx.app_context.create()
-        func = getattr(app, 'modify_wsgi_pipeline', None)
+        ultimate_app = ctx.app_context.create()
+        func = getattr(ultimate_app, 'modify_wsgi_pipeline', None)
         if func and allow_modify_pipeline:
             func(PipelineWrapper(ctx))
-        # cache the freshly created app so we con't have to redo
-        # initialization checks and log startup messages again
-        ctx.app_context.create = lambda: app
+        filters = [c.create() for c in reversed(ctx.filter_contexts)]
+        app = ultimate_app
+        app._pipeline_final_app = ultimate_app
+        for filter_app in filters:
+            app = filter_app(app)
+            app._pipeline_final_app = ultimate_app
+        return app
     return ctx.create()
 
 
@@ -426,233 +388,12 @@ def load_app_config(conf_file):
     return app_conf
 
 
-class SwiftHttpProtocol(wsgi.HttpProtocol):
-    default_request_version = "HTTP/1.0"
-
-    def __init__(self, *args, **kwargs):
-        # See https://github.com/eventlet/eventlet/pull/590
-        self.pre_shutdown_bugfix_eventlet = not getattr(
-            websocket.WebSocketWSGI, '_WSGI_APP_ALWAYS_IDLE', None)
-        # Note this is not a new-style class, so super() won't work
-        wsgi.HttpProtocol.__init__(self, *args, **kwargs)
-
-    def log_request(self, *a):
-        """
-        Turn off logging requests by the underlying WSGI software.
-        """
-        pass
-
-    def log_message(self, f, *a):
-        """
-        Redirect logging other messages by the underlying WSGI software.
-        """
-        logger = getattr(self.server.app, 'logger', None)
-        if logger:
-            logger.error('ERROR WSGI: ' + f, *a)
-        else:
-            # eventlet<=0.17.4 doesn't have an error method, and in newer
-            # versions the output from error is same as info anyway
-            self.server.log.info('ERROR WSGI: ' + f, *a)
-
-    class MessageClass(wsgi.HttpProtocol.MessageClass):
-        '''Subclass to see when the client didn't provide a Content-Type'''
-        # for py2:
-        def parsetype(self):
-            if self.typeheader is None:
-                self.typeheader = ''
-            wsgi.HttpProtocol.MessageClass.parsetype(self)
-
-        # for py3:
-        def get_default_type(self):
-            '''If the client didn't provide a content type, leave it blank.'''
-            return ''
-
-    def parse_request(self):
-        if not six.PY2:
-            # request lines *should* be ascii per the RFC, but historically
-            # we've allowed (and even have func tests that use) arbitrary
-            # bytes. This breaks on py3 (see https://bugs.python.org/issue33973
-            # ) but the work-around is simple: munge the request line to be
-            # properly quoted. py2 will do the right thing without this, but it
-            # doesn't hurt to re-write the request line like this and it
-            # simplifies testing.
-            if self.raw_requestline.count(b' ') >= 2:
-                parts = self.raw_requestline.split(b' ', 2)
-                path, q, query = parts[1].partition(b'?')
-                # unquote first, so we don't over-quote something
-                # that was *correctly* quoted
-                path = wsgi_to_bytes(wsgi_quote(wsgi_unquote(
-                    bytes_to_wsgi(path))))
-                query = b'&'.join(
-                    sep.join([
-                        wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
-                            bytes_to_wsgi(key)))),
-                        wsgi_to_bytes(wsgi_quote_plus(wsgi_unquote_plus(
-                            bytes_to_wsgi(val))))
-                    ])
-                    for part in query.split(b'&')
-                    for key, sep, val in (part.partition(b'='), ))
-                parts[1] = path + q + query
-                self.raw_requestline = b' '.join(parts)
-            # else, mangled protocol, most likely; let base class deal with it
-        return wsgi.HttpProtocol.parse_request(self)
-
-    if not six.PY2:
-        def get_environ(self, *args, **kwargs):
-            environ = wsgi.HttpProtocol.get_environ(self, *args, **kwargs)
-            header_payload = self.headers.get_payload()
-            if isinstance(header_payload, list) and len(header_payload) == 1:
-                header_payload = header_payload[0].get_payload()
-            if header_payload:
-                # This shouldn't be here. We must've bumped up against
-                # https://bugs.python.org/issue37093
-                headers_raw = list(environ['headers_raw'])
-                for line in header_payload.rstrip('\r\n').split('\n'):
-                    if ':' not in line or line[:1] in ' \t':
-                        # Well, we're no more broken than we were before...
-                        # Should we support line folding?
-                        # Should we 400 a bad header line?
-                        break
-                    header, value = line.split(':', 1)
-                    value = value.strip(' \t\n\r')
-                    # NB: Eventlet looks at the headers obj to figure out
-                    # whether the client said the connection should close;
-                    # see https://github.com/eventlet/eventlet/blob/v0.25.0/
-                    # eventlet/wsgi.py#L504
-                    self.headers.add_header(header, value)
-                    headers_raw.append((header, value))
-                    wsgi_key = 'HTTP_' + header.replace('-', '_').encode(
-                        'latin1').upper().decode('latin1')
-                    if wsgi_key in ('HTTP_CONTENT_LENGTH',
-                                    'HTTP_CONTENT_TYPE'):
-                        wsgi_key = wsgi_key[5:]
-                    environ[wsgi_key] = value
-                environ['headers_raw'] = tuple(headers_raw)
-                # Since we parsed some more headers, check to see if they
-                # change how our wsgi.input should behave
-                te = environ.get('HTTP_TRANSFER_ENCODING', '').lower()
-                if te.rsplit(',', 1)[-1].strip() == 'chunked':
-                    environ['wsgi.input'].chunked_input = True
-                else:
-                    length = environ.get('CONTENT_LENGTH')
-                    if length:
-                        length = int(length)
-                    environ['wsgi.input'].content_length = length
-                if environ.get('HTTP_EXPECT', '').lower() == '100-continue':
-                    environ['wsgi.input'].wfile = self.wfile
-                    environ['wsgi.input'].wfile_line = \
-                        b'HTTP/1.1 100 Continue\r\n'
-            return environ
-
-    def _read_request_line(self):
-        # Note this is not a new-style class, so super() won't work
-        got = wsgi.HttpProtocol._read_request_line(self)
-        # See https://github.com/eventlet/eventlet/pull/590
-        if self.pre_shutdown_bugfix_eventlet:
-            self.conn_state[2] = wsgi.STATE_REQUEST
-        return got
-
-    def handle_one_request(self):
-        # Note this is not a new-style class, so super() won't work
-        got = wsgi.HttpProtocol.handle_one_request(self)
-        # See https://github.com/eventlet/eventlet/pull/590
-        if self.pre_shutdown_bugfix_eventlet:
-            if self.conn_state[2] != wsgi.STATE_CLOSE:
-                self.conn_state[2] = wsgi.STATE_IDLE
-        return got
-
-
-class SwiftHttpProxiedProtocol(SwiftHttpProtocol):
-    """
-    Protocol object that speaks HTTP, including multiple requests, but with
-    a single PROXY line as the very first thing coming in over the socket.
-    This is so we can learn what the client's IP address is when Swift is
-    behind a TLS terminator, like hitch, that does not understand HTTP and
-    so cannot add X-Forwarded-For or other similar headers.
-
-    See http://www.haproxy.org/download/1.7/doc/proxy-protocol.txt for
-    protocol details.
-    """
-    def __init__(self, *a, **kw):
-        self.proxy_address = None
-        SwiftHttpProtocol.__init__(self, *a, **kw)
-
-    def handle_error(self, connection_line):
-        if not six.PY2:
-            connection_line = connection_line.decode('latin-1')
-
-        # No further processing will proceed on this connection under any
-        # circumstances.  We always send the request into the superclass to
-        # handle any cleanup - this ensures that the request will not be
-        # processed.
-        self.rfile.close()
-        # We don't really have any confidence that an HTTP Error will be
-        # processable by the client as our transmission broken down between
-        # ourselves and our gateway proxy before processing the client
-        # protocol request.  Hopefully the operator will know what to do!
-        msg = 'Invalid PROXY line %r' % connection_line
-        self.log_message(msg)
-        # Even assuming HTTP we don't even known what version of HTTP the
-        # client is sending?  This entire endeavor seems questionable.
-        self.request_version = self.default_request_version
-        # appease http.server
-        self.command = 'PROXY'
-        self.send_error(400, msg)
-
-    def handle(self):
-        """Handle multiple requests if necessary."""
-        # ensure the opening line for the connection is a valid PROXY protcol
-        # line; this is the only IO we do on this connection before any
-        # additional wrapping further pollutes the raw socket.
-        connection_line = self.rfile.readline(self.server.url_length_limit)
-
-        if not connection_line.startswith(b'PROXY '):
-            return self.handle_error(connection_line)
-
-        proxy_parts = connection_line.strip(b'\r\n').split(b' ')
-        if proxy_parts[1].startswith(b'UNKNOWN'):
-            # "UNKNOWN", in PROXY protocol version 1, means "not
-            # TCP4 or TCP6". This includes completely legitimate
-            # things like QUIC or Unix domain sockets. The PROXY
-            # protocol (section 2.1) states that the receiver
-            # (that's us) MUST ignore anything after "UNKNOWN" and
-            # before the CRLF, essentially discarding the first
-            # line.
-            pass
-        elif proxy_parts[1] in (b'TCP4', b'TCP6') and len(proxy_parts) == 6:
-            if six.PY2:
-                self.client_address = (proxy_parts[2], proxy_parts[4])
-                self.proxy_address = (proxy_parts[3], proxy_parts[5])
-            else:
-                self.client_address = (
-                    proxy_parts[2].decode('latin-1'),
-                    proxy_parts[4].decode('latin-1'))
-                self.proxy_address = (
-                    proxy_parts[3].decode('latin-1'),
-                    proxy_parts[5].decode('latin-1'))
-        else:
-            self.handle_error(connection_line)
-
-        return SwiftHttpProtocol.handle(self)
-
-    def get_environ(self, *args, **kwargs):
-        environ = SwiftHttpProtocol.get_environ(self, *args, **kwargs)
-        if self.proxy_address:
-            environ['SERVER_ADDR'] = self.proxy_address[0]
-            environ['SERVER_PORT'] = self.proxy_address[1]
-            if self.proxy_address[1] == '443':
-                environ['wsgi.url_scheme'] = 'https'
-                environ['HTTPS'] = 'on'
-        return environ
-
-
-def run_server(conf, logger, sock, global_conf=None):
+def run_server(conf, logger, sock, global_conf=None, ready_callback=None,
+               allow_modify_pipeline=True):
     # Ensure TZ environment variable exists to avoid stat('/etc/localtime') on
     # some platforms. This locks in reported times to UTC.
     os.environ['TZ'] = 'UTC+0'
     time.tzset()
-
-    wsgi.WRITE_TIMEOUT = int(conf.get('client_timeout') or 60)
 
     eventlet.hubs.use_hub(get_hub())
     eventlet_debug = config_true_value(conf.get('eventlet_debug', 'no'))
@@ -668,7 +409,8 @@ def run_server(conf, logger, sock, global_conf=None):
         else:
             log_name = logger.name
         global_conf = {'log_name': log_name}
-    app = loadapp(conf['__file__'], global_conf=global_conf)
+    app = loadapp(conf['__file__'], global_conf=global_conf,
+                  allow_modify_pipeline=allow_modify_pipeline)
     max_clients = int(conf.get('max_clients', '1024'))
     pool = RestrictedGreenPool(size=max_clients)
 
@@ -682,11 +424,17 @@ def run_server(conf, logger, sock, global_conf=None):
     server_kwargs = {
         'custom_pool': pool,
         'protocol': protocol_class,
+        'socket_timeout': float(conf.get('client_timeout') or 60),
         # Disable capitalizing headers in Eventlet. This is necessary for
         # the AWS SDK to work with s3api middleware (it needs an "ETag"
         # header; "Etag" just won't do).
         'capitalize_response_headers': False,
     }
+    if ready_callback:
+        ready_callback()
+    # Yes, eventlet, we know -- we have to support bad clients, though
+    warnings.filterwarnings(
+        'ignore', message='capitalize_response_headers is disabled')
     try:
         wsgi.server(sock, app, wsgi_logger, **server_kwargs)
     except socket.error as err:
@@ -699,6 +447,15 @@ class StrategyBase(object):
     """
     Some operations common to all strategy classes.
     """
+    def __init__(self, conf, logger):
+        self.conf = conf
+        self.logger = logger
+        self.signaled_ready = False
+
+        # Each strategy is welcome to track data however it likes, but all
+        # socket refs should be somewhere in this dict. This allows forked-off
+        # children to easily drop refs to sibling sockets in post_fork_hook().
+        self.tracking_data = {}
 
     def post_fork_hook(self):
         """
@@ -706,7 +463,10 @@ class StrategyBase(object):
         wsgi server, to perform any initialization such as drop privileges.
         """
 
+        if not self.signaled_ready:
+            capture_stdio(self.logger)
         drop_privileges(self.conf.get('user', 'swift'))
+        del self.tracking_data  # children don't need to track siblings
 
     def shutdown_sockets(self):
         """
@@ -731,11 +491,39 @@ class StrategyBase(object):
                 # on socket objects is provided to toggle it.
                 sock.set_inheritable(False)
 
+    def signal_ready(self):
+        """
+        Signal that the server is up and accepting connections.
+        """
+        if self.signaled_ready:
+            return  # Already did it
+
+        # Redirect errors to logger and close stdio. swift-init (for example)
+        # uses this to know that the service is ready to accept connections.
+        capture_stdio(self.logger)
+
+        # If necessary, signal an old copy of us that it's okay to shutdown
+        # its listen sockets now because ours are up and ready to receive
+        # connections. This is used for seamless reloading using SIGUSR1.
+        reexec_signal_fd = os.getenv(NOTIFY_FD_ENV_KEY)
+        if reexec_signal_fd:
+            reexec_signal_fd = int(reexec_signal_fd)
+            os.write(reexec_signal_fd, str(os.getpid()).encode('utf8'))
+            os.close(reexec_signal_fd)
+
+        # Finally, signal systemd (if appropriate) that process started
+        # properly.
+        systemd_notify(logger=self.logger)
+
+        self.signaled_ready = True
+
 
 class WorkersStrategy(StrategyBase):
     """
     WSGI server management strategy object for a single bind port and listen
     socket shared by a configured number of forked-off workers.
+
+    Tracking data is a map of ``pid -> socket``.
 
     Used in :py:func:`run_wsgi`.
 
@@ -745,10 +533,7 @@ class WorkersStrategy(StrategyBase):
     """
 
     def __init__(self, conf, logger):
-        self.conf = conf
-        self.logger = logger
-        self.sock = None
-        self.children = []
+        super(WorkersStrategy, self).__init__(conf, logger)
         self.worker_count = config_auto_int_value(conf.get('workers'),
                                                   CPU_COUNT)
 
@@ -763,18 +548,6 @@ class WorkersStrategy(StrategyBase):
 
         return 0.5
 
-    def do_bind_ports(self):
-        """
-        Bind the one listen socket for this strategy.
-        """
-
-        try:
-            self.sock = get_socket(self.conf)
-        except ConfigFilePortError:
-            msg = 'bind_port wasn\'t properly set in the config file. ' \
-                'It must be explicitly set to a valid port number.'
-            return msg
-
     def no_fork_sock(self):
         """
         Return a server listen socket if the server should run in the
@@ -783,7 +556,7 @@ class WorkersStrategy(StrategyBase):
 
         # Useful for profiling [no forks].
         if self.worker_count == 0:
-            return self.sock
+            return get_socket(self.conf)
 
     def new_worker_socks(self):
         """
@@ -795,8 +568,8 @@ class WorkersStrategy(StrategyBase):
         where it will be ignored.
         """
 
-        while len(self.children) < self.worker_count:
-            yield self.sock, None
+        while len(self.tracking_data) < self.worker_count:
+            yield get_socket(self.conf), None
 
     def log_sock_exit(self, sock, _unused):
         """
@@ -820,7 +593,7 @@ class WorkersStrategy(StrategyBase):
 
         self.logger.notice('Started child %s from parent %s',
                            pid, os.getpid())
-        self.children.append(pid)
+        self.tracking_data[pid] = sock
 
     def register_worker_exit(self, pid):
         """
@@ -833,139 +606,22 @@ class WorkersStrategy(StrategyBase):
         :param int pid: The PID of the worker that exited.
         """
 
-        if pid in self.children:
+        sock = self.tracking_data.pop(pid, None)
+        if sock is None:
+            self.logger.info('Ignoring wait() result from unknown PID %s', pid)
+        else:
             self.logger.error('Removing dead child %s from parent %s',
                               pid, os.getpid())
-            self.children.remove(pid)
-        else:
-            self.logger.info('Ignoring wait() result from unknown PID %s', pid)
+            greenio.shutdown_safe(sock)
+            sock.close()
 
     def iter_sockets(self):
         """
         Yields all known listen sockets.
         """
 
-        if self.sock:
-            yield self.sock
-
-
-class PortPidState(object):
-    """
-    A helper class for :py:class:`ServersPerPortStrategy` to track listen
-    sockets and PIDs for each port.
-
-    :param int servers_per_port: The configured number of servers per port.
-    :param logger: The server's :py:class:`~swift.common.utils.LogAdaptor`
-    """
-
-    def __init__(self, servers_per_port, logger):
-        self.servers_per_port = servers_per_port
-        self.logger = logger
-        self.sock_data_by_port = {}
-
-    def sock_for_port(self, port):
-        """
-        :param int port: The port whose socket is desired.
-        :returns: The bound listen socket for the given port.
-        """
-
-        return self.sock_data_by_port[port]['sock']
-
-    def port_for_sock(self, sock):
-        """
-        :param socket sock: A tracked bound listen socket
-        :returns: The port the socket is bound to.
-        """
-
-        for port, sock_data in self.sock_data_by_port.items():
-            if sock_data['sock'] == sock:
-                return port
-
-    def _pid_to_port_and_index(self, pid):
-        for port, sock_data in self.sock_data_by_port.items():
-            for server_idx, a_pid in enumerate(sock_data['pids']):
-                if pid == a_pid:
-                    return port, server_idx
-
-    def port_index_pairs(self):
-        """
-        Returns current (port, server index) pairs.
-
-        :returns: A set of (port, server_idx) tuples for currently-tracked
-            ports, sockets, and PIDs.
-        """
-
-        current_port_index_pairs = set()
-        for port, pid_state in self.sock_data_by_port.items():
-            current_port_index_pairs |= set(
-                (port, i)
-                for i, pid in enumerate(pid_state['pids'])
-                if pid is not None)
-        return current_port_index_pairs
-
-    def track_port(self, port, sock):
-        """
-        Start tracking servers for the given port and listen socket.
-
-        :param int port: The port to start tracking
-        :param socket sock: The bound listen socket for the port.
-        """
-
-        self.sock_data_by_port[port] = {
-            'sock': sock,
-            'pids': [None] * self.servers_per_port,
-        }
-
-    def not_tracking(self, port):
-        """
-        Return True if the specified port is not being tracked.
-
-        :param int port: A port to check.
-        """
-
-        return port not in self.sock_data_by_port
-
-    def all_socks(self):
-        """
-        Yield all current listen sockets.
-        """
-
-        for orphan_data in self.sock_data_by_port.values():
-            yield orphan_data['sock']
-
-    def forget_port(self, port):
-        """
-        Idempotently forget a port, closing the listen socket at most once.
-        """
-
-        orphan_data = self.sock_data_by_port.pop(port, None)
-        if orphan_data:
-            greenio.shutdown_safe(orphan_data['sock'])
-            orphan_data['sock'].close()
-            self.logger.notice('Closing unnecessary sock for port %d', port)
-
-    def add_pid(self, port, index, pid):
-        self.sock_data_by_port[port]['pids'][index] = pid
-
-    def forget_pid(self, pid):
-        """
-        Idempotently forget a PID.  It's okay if the PID is no longer in our
-        data structure (it could have been removed by the "orphan port" removal
-        in :py:meth:`new_worker_socks`).
-
-        :param int pid: The PID which exited.
-        """
-
-        port_server_idx = self._pid_to_port_and_index(pid)
-        if port_server_idx is None:
-            # This method can lose a race with the "orphan port" removal, when
-            # a ring reload no longer contains a port.  So it's okay if we were
-            # unable to find a (port, server_idx) pair.
-            return
-        dead_port, server_idx = port_server_idx
-        self.logger.error('Removing dead child %d (PID: %s) for port %s',
-                          server_idx, pid, dead_port)
-        self.sock_data_by_port[dead_port]['pids'][server_idx] = None
+        for sock in self.tracking_data.values():
+            yield sock
 
 
 class ServersPerPortStrategy(StrategyBase):
@@ -974,6 +630,8 @@ class ServersPerPortStrategy(StrategyBase):
     port per unique local port in the storage policy rings.  The
     `servers_per_port` integer config setting determines how many workers are
     run per port.
+
+    Tracking data is a map like ``port -> [(pid, socket), ...]``.
 
     Used in :py:func:`run_wsgi`.
 
@@ -984,15 +642,16 @@ class ServersPerPortStrategy(StrategyBase):
     """
 
     def __init__(self, conf, logger, servers_per_port):
-        self.conf = conf
-        self.logger = logger
+        super(ServersPerPortStrategy, self).__init__(conf, logger)
         self.servers_per_port = servers_per_port
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.ring_check_interval = int(conf.get('ring_check_interval', 15))
-        self.port_pid_state = PortPidState(servers_per_port, logger)
+        self.ring_check_interval = float(conf.get('ring_check_interval', 15))
 
-        bind_ip = conf.get('bind_ip', '0.0.0.0')
-        self.cache = BindPortsCache(self.swift_dir, bind_ip)
+        # typically ring_ip will be the same as bind_ip, but in a container the
+        # bind_ip might be differnt than the host ip address used to lookup
+        # devices/ports in the ring
+        ring_ip = conf.get('ring_ip', conf.get('bind_ip', '0.0.0.0'))
+        self.cache = BindPortsCache(self.swift_dir, ring_ip)
 
     def _reload_bind_ports(self):
         self.bind_ports = self.cache.all_bind_ports_for_node()
@@ -1000,8 +659,7 @@ class ServersPerPortStrategy(StrategyBase):
     def _bind_port(self, port):
         new_conf = self.conf.copy()
         new_conf['bind_port'] = port
-        sock = get_socket(new_conf)
-        self.port_pid_state.track_port(port, sock)
+        return get_socket(new_conf)
 
     def loop_timeout(self):
         """
@@ -1013,15 +671,6 @@ class ServersPerPortStrategy(StrategyBase):
 
         return self.ring_check_interval
 
-    def do_bind_ports(self):
-        """
-        Bind one listen socket per unique local storage policy ring port.
-        """
-
-        self._reload_bind_ports()
-        for port in self.bind_ports:
-            self._bind_port(port)
-
     def no_fork_sock(self):
         """
         This strategy does not support running in the foreground.
@@ -1031,8 +680,8 @@ class ServersPerPortStrategy(StrategyBase):
 
     def new_worker_socks(self):
         """
-        Yield a sequence of (socket, server_idx) tuples for each server which
-        should be forked-off and started.
+        Yield a sequence of (socket, (port, server_idx)) tuples for each server
+        which should be forked-off and started.
 
         Any sockets for "orphaned" ports no longer in any ring will be closed
         (causing their associated workers to gracefully exit) after all new
@@ -1043,11 +692,15 @@ class ServersPerPortStrategy(StrategyBase):
         """
 
         self._reload_bind_ports()
-        desired_port_index_pairs = set(
+        desired_port_index_pairs = {
             (p, i) for p in self.bind_ports
-            for i in range(self.servers_per_port))
+            for i in range(self.servers_per_port)}
 
-        current_port_index_pairs = self.port_pid_state.port_index_pairs()
+        current_port_index_pairs = {
+            (p, i)
+            for p, port_data in self.tracking_data.items()
+            for i, (pid, sock) in enumerate(port_data)
+            if pid is not None}
 
         if desired_port_index_pairs != current_port_index_pairs:
             # Orphan ports are ports which had object-server processes running,
@@ -1056,49 +709,59 @@ class ServersPerPortStrategy(StrategyBase):
             orphan_port_index_pairs = current_port_index_pairs - \
                 desired_port_index_pairs
 
-            # Fork off worker(s) for every port who's supposed to have
+            # Fork off worker(s) for every port that's supposed to have
             # worker(s) but doesn't
             missing_port_index_pairs = desired_port_index_pairs - \
                 current_port_index_pairs
             for port, server_idx in sorted(missing_port_index_pairs):
-                if self.port_pid_state.not_tracking(port):
-                    try:
-                        self._bind_port(port)
-                    except Exception as e:
-                        self.logger.critical('Unable to bind to port %d: %s',
-                                             port, e)
-                        continue
-                yield self.port_pid_state.sock_for_port(port), server_idx
+                try:
+                    sock = self._bind_port(port)
+                except Exception as e:
+                    self.logger.critical('Unable to bind to port %d: %s',
+                                         port, e)
+                    continue
+                yield sock, (port, server_idx)
 
-            for orphan_pair in orphan_port_index_pairs:
+            for port, idx in orphan_port_index_pairs:
                 # For any port in orphan_port_index_pairs, it is guaranteed
                 # that there should be no listen socket for that port, so we
                 # can close and forget them.
-                self.port_pid_state.forget_port(orphan_pair[0])
+                pid, sock = self.tracking_data[port][idx]
+                greenio.shutdown_safe(sock)
+                sock.close()
+                self.logger.notice(
+                    'Closing unnecessary sock for port %d (child pid %d)',
+                    port, pid)
+                self.tracking_data[port][idx] = (None, None)
+                if all(sock is None
+                       for _pid, sock in self.tracking_data[port]):
+                    del self.tracking_data[port]
 
-    def log_sock_exit(self, sock, server_idx):
+    def log_sock_exit(self, sock, data):
         """
         Log a server's exit.
         """
 
-        port = self.port_pid_state.port_for_sock(sock)
+        port, server_idx = data
         self.logger.notice('Child %d (PID %d, port %d) exiting normally',
                            server_idx, os.getpid(), port)
 
-    def register_worker_start(self, sock, server_idx, pid):
+    def register_worker_start(self, sock, data, pid):
         """
         Called when a new worker is started.
 
         :param socket sock: The listen socket for the worker just started.
-        :param server_idx: The socket's server_idx as yielded by
+        :param tuple data: The socket's (port, server_idx) as yielded by
                            :py:meth:`new_worker_socks`.
         :param int pid: The new worker process' PID
         """
 
-        port = self.port_pid_state.port_for_sock(sock)
+        port, server_idx = data
         self.logger.notice('Started child %d (PID %d) for port %d',
                            server_idx, pid, port)
-        self.port_pid_state.add_pid(port, server_idx, pid)
+        if port not in self.tracking_data:
+            self.tracking_data[port] = [(None, None)] * self.servers_per_port
+        self.tracking_data[port][server_idx] = (pid, sock)
 
     def register_worker_exit(self, pid):
         """
@@ -1107,15 +770,22 @@ class ServersPerPortStrategy(StrategyBase):
         :param int pid: The PID of the worker that exited.
         """
 
-        self.port_pid_state.forget_pid(pid)
+        for port_data in self.tracking_data.values():
+            for idx, (child_pid, sock) in enumerate(port_data):
+                if child_pid == pid:
+                    port_data[idx] = (None, None)
+                    greenio.shutdown_safe(sock)
+                    sock.close()
+                    return
 
     def iter_sockets(self):
         """
         Yields all known listen sockets.
         """
 
-        for sock in self.port_pid_state.all_socks():
-            yield sock
+        for port_data in self.tracking_data.values():
+            for _pid, sock in port_data:
+                yield sock
 
 
 def run_wsgi(conf_path, app_section, *args, **kwargs):
@@ -1127,6 +797,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
 
     :param conf_path: Path to paste.deploy style configuration file/directory
     :param app_section: App name from conf file to load config from
+    :param allow_modify_pipeline: Boolean for whether the server should have
+                                  an opportunity to change its own pipeline.
+                                  Defaults to True
     :returns: 0 if successful, nonzero otherwise
     """
     # Load configuration, Set logger and Load request processor
@@ -1150,6 +823,15 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
             conf, logger, servers_per_port=servers_per_port)
     else:
         strategy = WorkersStrategy(conf, logger)
+        try:
+            # Quick sanity check
+            int(conf['bind_port'])
+        except (ValueError, KeyError, TypeError):
+            error_msg = 'bind_port wasn\'t properly set in the config file. ' \
+                'It must be explicitly set to a valid port number.'
+            logger.error(error_msg)
+            print(error_msg)
+            return 1
 
     # patch event before loadapp
     utils.eventlet_monkey_patch()
@@ -1160,39 +842,21 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     if 'global_conf_callback' in kwargs:
         kwargs['global_conf_callback'](conf, global_conf)
 
+    allow_modify_pipeline = kwargs.get('allow_modify_pipeline', True)
+
     # set utils.FALLOCATE_RESERVE if desired
     utils.FALLOCATE_RESERVE, utils.FALLOCATE_IS_PERCENT = \
         utils.config_fallocate_value(conf.get('fallocate_reserve', '1%'))
-
-    # Start listening on bind_addr/port
-    error_msg = strategy.do_bind_ports()
-    if error_msg:
-        logger.error(error_msg)
-        print(error_msg)
-        return 1
 
     # Do some daemonization process hygene before we fork any children or run a
     # server without forking.
     clean_up_daemon_hygiene()
 
-    # Redirect errors to logger and close stdio. Do this *after* binding ports;
-    # we use this to signal that the service is ready to accept connections.
-    capture_stdio(logger)
-
-    # If necessary, signal an old copy of us that it's okay to shutdown its
-    # listen sockets now because ours are up and ready to receive connections.
-    reexec_signal_fd = os.getenv(NOTIFY_FD_ENV_KEY)
-    if reexec_signal_fd:
-        reexec_signal_fd = int(reexec_signal_fd)
-        os.write(reexec_signal_fd, str(os.getpid()).encode('utf8'))
-        os.close(reexec_signal_fd)
-
-    # Finally, signal systemd (if appropriate) that process started properly.
-    systemd_notify(logger=logger)
-
     no_fork_sock = strategy.no_fork_sock()
     if no_fork_sock:
-        run_server(conf, logger, no_fork_sock, global_conf=global_conf)
+        run_server(conf, logger, no_fork_sock, global_conf=global_conf,
+                   ready_callback=strategy.signal_ready,
+                   allow_modify_pipeline=allow_modify_pipeline)
         return 0
 
     def stop_with_signal(signum, *args):
@@ -1207,18 +871,45 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
     signal.signal(signal.SIGUSR1, stop_with_signal)
 
     while running_context[0]:
+        new_workers = {}  # pid -> status pipe
         for sock, sock_info in strategy.new_worker_socks():
+            read_fd, write_fd = os.pipe()
             pid = os.fork()
             if pid == 0:
-                signal.signal(signal.SIGHUP, signal.SIG_DFL)
+                os.close(read_fd)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+
+                def shutdown_my_listen_sock(signum, *args):
+                    greenio.shutdown_safe(sock)
+
+                signal.signal(signal.SIGHUP, shutdown_my_listen_sock)
+                signal.signal(signal.SIGUSR1, shutdown_my_listen_sock)
                 strategy.post_fork_hook()
-                run_server(conf, logger, sock)
+
+                def notify():
+                    os.write(write_fd, b'ready')
+                    os.close(write_fd)
+
+                run_server(conf, logger, sock, ready_callback=notify,
+                           allow_modify_pipeline=allow_modify_pipeline)
                 strategy.log_sock_exit(sock, sock_info)
                 return 0
             else:
+                os.close(write_fd)
+                new_workers[pid] = read_fd
                 strategy.register_worker_start(sock, sock_info, pid)
+
+        for pid, read_fd in new_workers.items():
+            worker_status = os.read(read_fd, 30)
+            os.close(read_fd)
+            if worker_status != b'ready':
+                raise Exception(
+                    'worker %d did not start normally: %r' %
+                    (pid, worker_status))
+
+        # TODO: signal_ready() as soon as we have at least one new worker for
+        # each port, instead of waiting for all of them
+        strategy.signal_ready()
 
         # The strategy may need to pay attention to something in addition to
         # child process exits (like new ports showing up in a ring).
@@ -1257,7 +948,7 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
             logger.error('Stopping with unexpected signal %r' %
                          running_context[1])
         else:
-            logger.error('%s received (%s)', signame, os.getpid())
+            logger.notice('%s received (%s)', signame, os.getpid())
     if running_context[1] == signal.SIGTERM:
         os.killpg(0, signal.SIGTERM)
     elif running_context[1] == signal.SIGUSR1:
@@ -1390,7 +1081,8 @@ class WSGIContext(object):
         Uses the same semantics as the usual WSGI start_response.
         """
         self._response_status = status
-        self._response_headers = headers
+        self._response_headers = \
+            headers if isinstance(headers, list) else list(headers)
         self._response_exc_info = exc_info
 
     def _app_call(self, env):
@@ -1462,7 +1154,8 @@ def make_env(env, method=None, path=None, agent='Swift', query_string=None,
                  'SERVER_PROTOCOL', 'swift.cache', 'swift.source',
                  'swift.trans_id', 'swift.authorize_override',
                  'swift.authorize', 'HTTP_X_USER_ID', 'HTTP_X_PROJECT_ID',
-                 'HTTP_REFERER', 'swift.infocache'):
+                 'HTTP_REFERER', 'swift.infocache',
+                 'swift.shard_listing_history'):
         if name in env:
             newenv[name] = env[name]
     if method:

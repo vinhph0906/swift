@@ -16,23 +16,39 @@
 import os
 import sys
 import gettext
+import warnings
 
-import pkg_resources
+__version__ = None
 
+# First, try to get our version out of PKG-INFO. If we're installed,
+# this'll let us find our version without pulling in pbr. After all, if
+# we're installed on a system, we're not in a Git-managed source tree, so
+# pbr doesn't really buy us anything.
 try:
-    # First, try to get our version out of PKG-INFO. If we're installed,
-    # this'll let us find our version without pulling in pbr. After all, if
-    # we're installed on a system, we're not in a Git-managed source tree, so
-    # pbr doesn't really buy us anything.
-    __version__ = __canonical_version__ = pkg_resources.get_provider(
-        pkg_resources.Requirement.parse('swift')).version
-except pkg_resources.DistributionNotFound:
+    import importlib.metadata
+except ImportError:
+    # python < 3.8
+    import pkg_resources
+    try:
+        __version__ = __canonical_version__ = pkg_resources.get_provider(
+            pkg_resources.Requirement.parse('swift')).version
+    except pkg_resources.DistributionNotFound:
+        pass
+else:
+    try:
+        __version__ = __canonical_version__ = importlib.metadata.distribution(
+            'swift').version
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+if __version__ is None:
     # No PKG-INFO? We're probably running from a checkout, then. Let pbr do
     # its thing to figure out a version number.
     import pbr.version
     _version_info = pbr.version.VersionInfo('swift')
     __version__ = _version_info.release_string()
     __canonical_version__ = _version_info.version_string()
+
 
 _localedir = os.environ.get('SWIFT_LOCALEDIR')
 _t = gettext.translation('swift', localedir=_localedir, fallback=True)
@@ -74,3 +90,11 @@ if (3, 0) <= sys.version_info[:2] <= (3, 5):
 
         json.loads = JsonLoadsPatcher(json.loads)
         del JsonLoadsPatcher
+
+
+warnings.filterwarnings('ignore', module='cryptography|OpenSSL', message=(
+    'Python 2 is no longer supported by the Python core team. '
+    'Support for it is now deprecated in cryptography'))
+warnings.filterwarnings('ignore', message=(
+    'Python 3.6 is no longer supported by the Python core team. '
+    'Therefore, support for it is deprecated in cryptography'))

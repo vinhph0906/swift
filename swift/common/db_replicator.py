@@ -34,7 +34,7 @@ from swift.common.utils import get_logger, whataremyips, storage_directory, \
     renamer, mkdirs, lock_parent_directory, config_true_value, \
     unlink_older_than, dump_recon_cache, rsync_module_interpolation, \
     parse_override_options, round_robin_iter, Everything, get_db_files, \
-    parse_db_filename, quote, RateLimitedIterator
+    parse_db_filename, quote, RateLimitedIterator, config_auto_int_value
 from swift.common import ring
 from swift.common.ring.utils import is_local_device
 from swift.common.http import HTTP_NOT_FOUND, HTTP_INSUFFICIENT_STORAGE, \
@@ -44,6 +44,8 @@ from swift.common.exceptions import DriveNotMounted
 from swift.common.daemon import Daemon
 from swift.common.swob import Response, HTTPNotFound, HTTPNoContent, \
     HTTPAccepted, HTTPBadRequest
+from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
+    server_type_to_recon_file
 
 
 DEBUG_TIMINGS_THRESHOLD = 10
@@ -172,6 +174,7 @@ class ReplConnection(BufferedHTTPConnection):
             response.data = response.read()
             return response
         except (Exception, Timeout):
+            self.close()
             self.logger.exception(
                 _('ERROR reading HTTP response from %s'), self.node)
             return None
@@ -193,19 +196,27 @@ class Replicator(Daemon):
         self.cpool = GreenPool(size=concurrency)
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.ring = ring.Ring(swift_dir, ring_name=self.server_type)
-        self._local_device_ids = set()
+        self._local_device_ids = {}
         self.per_diff = int(conf.get('per_diff', 1000))
         self.max_diffs = int(conf.get('max_diffs') or 100)
-        self.interval = int(conf.get('interval') or
-                            conf.get('run_pause') or 30)
-        if 'run_pause' in conf and 'interval' not in conf:
-            self.logger.warning('Option %(type)s-replicator/run_pause '
-                                'is deprecated and will be removed in a '
-                                'future version. Update your configuration'
-                                ' to use option %(type)s-replicator/'
-                                'interval.'
-                                % {'type': self.server_type})
-        self.databases_per_second = int(
+        self.interval = float(conf.get('interval') or
+                              conf.get('run_pause') or 30)
+        if 'run_pause' in conf:
+            if 'interval' in conf:
+                self.logger.warning(
+                    'Option %(type)s-replicator/run_pause is deprecated '
+                    'and %(type)s-replicator/interval is already configured. '
+                    'You can safely remove run_pause; it is now ignored and '
+                    'will be removed in a future version.'
+                    % {'type': self.server_type})
+            else:
+                self.logger.warning(
+                    'Option %(type)s-replicator/run_pause is deprecated '
+                    'and will be removed in a future version. '
+                    'Update your configuration to use option '
+                    '%(type)s-replicator/interval.'
+                    % {'type': self.server_type})
+        self.databases_per_second = float(
             conf.get('databases_per_second', 50))
         self.node_timeout = float(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
@@ -221,13 +232,15 @@ class Replicator(Daemon):
             config_true_value(conf.get('db_query_logging', 'f'))
         self._zero_stats()
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.recon_replicator = '%s.recon' % self.server_type
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.recon_replicator = server_type_to_recon_file(self.server_type)
         self.rcache = os.path.join(self.recon_cache_path,
                                    self.recon_replicator)
         self.extract_device_re = re.compile('%s%s([^%s]+)' % (
             self.root, os.path.sep, os.path.sep))
         self.handoffs_only = config_true_value(conf.get('handoffs_only', 'no'))
+        self.handoff_delete = config_auto_int_value(
+            conf.get('handoff_delete', 'auto'), 0)
 
     def _zero_stats(self):
         """Zero out the stats."""
@@ -544,7 +557,13 @@ class Replicator(Daemon):
             reason = '%s new rows' % max_row_delta
             self.logger.debug(log_template, reason)
             return True
-        if not (responses and all(responses)):
+        if self.handoff_delete:
+            # delete handoff if we have had handoff_delete successes
+            successes_count = len([resp for resp in responses if resp])
+            delete_handoff = successes_count >= self.handoff_delete
+        else:
+            delete_handoff = responses and all(responses)
+        if not delete_handoff:
             reason = '%s/%s success' % (responses.count(True), len(responses))
             self.logger.debug(log_template, reason)
             return True
@@ -557,6 +576,12 @@ class Replicator(Daemon):
             return False
         self.logger.debug('Successfully deleted db %s', broker.db_file)
         return True
+
+    def _reclaim(self, broker, now=None):
+        if not now:
+            now = time.time()
+        return broker.reclaim(now - self.reclaim_age,
+                              now - (self.reclaim_age * 2))
 
     def _replicate_object(self, partition, object_file, node_id):
         """
@@ -583,8 +608,7 @@ class Replicator(Daemon):
         try:
             broker = self.brokerclass(object_file, pending_timeout=30,
                                       logger=self.logger)
-            broker.reclaim(now - self.reclaim_age,
-                           now - (self.reclaim_age * 2))
+            self._reclaim(broker, now)
             info = broker.get_replication_info()
             bpart = self.ring.get_part(
                 info['account'], info.get('container'))
@@ -695,16 +719,22 @@ class Replicator(Daemon):
         suf_dir = os.path.dirname(hash_dir)
         with lock_parent_directory(object_file):
             shutil.rmtree(hash_dir, True)
-        try:
-            os.rmdir(suf_dir)
-        except OSError as err:
-            if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
-                self.logger.exception(
-                    _('ERROR while trying to clean up %s') % suf_dir)
-                return False
         self.stats['remove'] += 1
         device_name = self.extract_device(object_file)
         self.logger.increment('removes.' + device_name)
+
+        for parent_dir in (suf_dir, os.path.dirname(suf_dir)):
+            try:
+                os.rmdir(parent_dir)
+            except OSError as err:
+                if err.errno == errno.ENOTEMPTY:
+                    break
+                elif err.errno == errno.ENOENT:
+                    continue
+                else:
+                    self.logger.exception(
+                        'ERROR while trying to clean up %s', parent_dir)
+                    return False
         return True
 
     def extract_device(self, object_file):
@@ -758,13 +788,14 @@ class Replicator(Daemon):
             self.logger.error(_('ERROR Failed to get my own IPs?'))
             return
 
-        if self.handoffs_only:
+        if self.handoffs_only or self.handoff_delete:
             self.logger.warning(
-                'Starting replication pass with handoffs_only enabled. '
-                'This mode is not intended for normal '
-                'operation; use handoffs_only with care.')
+                'Starting replication pass with handoffs_only '
+                'and/or handoffs_delete enabled. '
+                'These modes are not intended for normal '
+                'operation; use these options with care.')
 
-        self._local_device_ids = set()
+        self._local_device_ids = {}
         found_local = False
         for node in self.ring.devs:
             if node and is_local_device(ips, self.port,
@@ -791,7 +822,7 @@ class Replicator(Daemon):
                     time.time() - self.reclaim_age)
                 datadir = os.path.join(self.root, node['device'], self.datadir)
                 if os.path.isdir(datadir):
-                    self._local_device_ids.add(node['id'])
+                    self._local_device_ids[node['id']] = node
                     part_filt = self._partition_dir_filter(
                         node['id'], partitions_to_replicate)
                     dirs.append((datadir, node['id'], part_filt))
@@ -805,10 +836,11 @@ class Replicator(Daemon):
                 self._replicate_object, part, object_file, node_id)
         self.cpool.waitall()
         self.logger.info(_('Replication run OVER'))
-        if self.handoffs_only:
+        if self.handoffs_only or self.handoff_delete:
             self.logger.warning(
-                'Finished replication pass with handoffs_only enabled. '
-                'If handoffs_only is no longer required, disable it.')
+                'Finished replication pass with handoffs_only and/or '
+                'handoffs_delete enabled. If these are no longer required, '
+                'disable them.')
         self._report_stats()
 
     def run_forever(self, *args, **kwargs):

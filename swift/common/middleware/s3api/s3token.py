@@ -195,7 +195,9 @@ class S3Token(object):
 
                 auth = auth_plugin.load_from_options(**auth_options)
                 session = keystone_session.Session(auth=auth)
-                self.keystoneclient = keystone_client.Client(session=session)
+                self.keystoneclient = keystone_client.Client(
+                    session=session,
+                    region_name=conf.get('region_name'))
                 self._logger.info("Caching s3tokens for %s seconds",
                                   self._secret_cache_duration)
             except Exception:
@@ -401,8 +403,8 @@ class S3Token(object):
             tenant_to_connect = tenant_to_connect.encode('utf-8')
         self._logger.debug('Connecting with tenant: %s', tenant_to_connect)
         new_tenant_name = '%s%s' % (self._reseller_prefix, tenant_to_connect)
-        environ['PATH_INFO'] = environ['PATH_INFO'].replace(account,
-                                                            new_tenant_name)
+        environ['PATH_INFO'] = environ['PATH_INFO'].replace(
+            account, new_tenant_name, 1)
         return self._app(environ, start_response)
 
 

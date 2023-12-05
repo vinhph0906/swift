@@ -535,7 +535,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
 
         argv = ["", self.tmpfile, "add",
                 "r0z0-127.0.1.1:6200/sda1_some meta data", "100"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_remove_device(self):
         for search_value in self.search_values:
@@ -817,7 +817,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         ring.save(self.tmpfile)
 
         argv = ["", self.tmpfile, "remove", "d0"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_set_weight(self):
         for search_value in self.search_values:
@@ -2077,7 +2077,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                       'port': 66201,
                       'device': 'sda2',
                       })
-        ring.add_dev({'weight': 100.0,
+        ring.add_dev({'weight': 10000.0,
                       'region': 2,
                       'zone': 2,
                       'ip': '2001:db8:85a3::8a2e:370:7336',
@@ -2536,7 +2536,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         ring.save(self.tmpfile)
 
         argv = ["", self.tmpfile, "rebalance", "3"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_write_ring(self):
         self.create_sample_ring()

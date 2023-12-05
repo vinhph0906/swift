@@ -13,18 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import hmac
+import hashlib
 import unittest
-from hashlib import sha1
 from time import time
 
 import six
+if six.PY3:
+    from unittest import mock
+else:
+    import mock
 from io import BytesIO
 
 from swift.common.swob import Request, Response, wsgi_quote
 from swift.common.middleware import tempauth, formpost
+from swift.common.middleware.tempurl import DEFAULT_ALLOWED_DIGESTS
 from swift.common.utils import split_path
+from swift.common import registry, digest as digest_utils
 from swift.proxy.controllers.base import get_cache_key
+from test.debug_logger import debug_logger
 
 
 def hmac_msg(path, redirect, max_file_size, max_file_count, expires):
@@ -127,6 +135,7 @@ class TestFormPost(unittest.TestCase):
         self.app = FakeApp()
         self.auth = tempauth.filter_factory({})(self.app)
         self.formpost = formpost.filter_factory({})(self.auth)
+        self.logger = self.formpost.logger = debug_logger()
 
     def _make_request(self, path, tempurl_keys=(), **kwargs):
         req = Request.blank(path, **kwargs)
@@ -163,11 +172,23 @@ class TestFormPost(unittest.TestCase):
                 'meta': meta}
 
     def _make_sig_env_body(self, path, redirect, max_file_size, max_file_count,
-                           expires, key, user_agent=True):
-        sig = hmac.new(
+                           expires, key, user_agent=True, algorithm='sha512',
+                           prefix=True):
+        alg_name = algorithm
+        if six.PY2:
+            algorithm = getattr(hashlib, algorithm)
+        mac = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            algorithm)
+        if prefix:
+            if six.PY2:
+                sig = alg_name + ':' + base64.b64encode(mac.digest())
+            else:
+                sig = alg_name + ':' + base64.b64encode(
+                    mac.digest()).decode('ascii')
+        else:
+            sig = mac.hexdigest()
         body = [
             '------WebKitFormBoundaryNcxTqxSlX7t4TDkR',
             'Content-Disposition: form-data; name="redirect"',
@@ -297,7 +318,7 @@ class TestFormPost(unittest.TestCase):
         sig = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            hashlib.sha512).hexdigest()
         wsgi_input = '\r\n'.join([
             '------WebKitFormBoundaryNcxTqxSlX7t4TDkR',
             'Content-Disposition: form-data; name="redirect"',
@@ -415,7 +436,7 @@ class TestFormPost(unittest.TestCase):
         sig = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            hashlib.sha512).hexdigest()
         wsgi_input = '\r\n'.join([
             '-----------------------------168072824752491622650073',
             'Content-Disposition: form-data; name="redirect"',
@@ -532,7 +553,7 @@ class TestFormPost(unittest.TestCase):
         sig = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            hashlib.sha512).hexdigest()
         wsgi_input = '\r\n'.join([
             '------WebKitFormBoundaryq3CFxUjfsDMu8XsA',
             'Content-Disposition: form-data; name="redirect"',
@@ -652,7 +673,7 @@ class TestFormPost(unittest.TestCase):
         sig = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            hashlib.sha512).hexdigest()
         wsgi_input = '\r\n'.join([
             '-----------------------------7db20d93017c',
             'Content-Disposition: form-data; name="redirect"',
@@ -770,7 +791,7 @@ class TestFormPost(unittest.TestCase):
         sig = hmac.new(
             key,
             hmac_msg(path, redirect, max_file_size, max_file_count, expires),
-            sha1).hexdigest()
+            hashlib.sha512).hexdigest()
         wsgi_input = '\r\n'.join([
             '--------------------------dea19ac8502ca805',
             'Content-Disposition: form-data; name="redirect"',
@@ -1025,7 +1046,7 @@ class TestFormPost(unittest.TestCase):
         self.assertTrue(b'201 Created' in body)
         self.assertEqual(len(self.app.requests), 2)
 
-    def test_subrequest_fails(self):
+    def test_subrequest_fails_redirect_404(self):
         key = b'abc'
         sig, env, body = self._make_sig_env_body(
             '/v1/AUTH_test/container', 'http://brim.net', 1024, 10,
@@ -1060,6 +1081,36 @@ class TestFormPost(unittest.TestCase):
         self.assertEqual(location, 'http://brim.net?status=404&message=')
         self.assertIsNone(exc_info)
         self.assertTrue(b'http://brim.net?status=404&message=' in body)
+        self.assertEqual(len(self.app.requests), 1)
+
+    def test_subrequest_fails_no_redirect_503(self):
+        key = b'abc'
+        sig, env, body = self._make_sig_env_body(
+            '/v1/AUTH_test/container', '', 1024, 10,
+            int(time() + 86400), key)
+        env['wsgi.input'] = BytesIO(b'\r\n'.join(body))
+        env['swift.infocache'][get_cache_key('AUTH_test')] = (
+            self._fake_cache_env('AUTH_test', [key]))
+        env['swift.infocache'][get_cache_key(
+            'AUTH_test', 'container')] = {'meta': {}}
+        self.app = FakeApp(iter([('503 Server Error', {}, b'some bad news')]))
+        self.auth = tempauth.filter_factory({})(self.app)
+        self.formpost = formpost.filter_factory({})(self.auth)
+        status = [None]
+        headers = [None]
+        exc_info = [None]
+
+        def start_response(s, h, e=None):
+            status[0] = s
+            headers[0] = h
+            exc_info[0] = e
+
+        body = b''.join(self.formpost(env, start_response))
+        status = status[0]
+        headers = headers[0]
+        exc_info = exc_info[0]
+        self.assertEqual(status, '503 Server Error')
+        self.assertTrue(b'bad news' in body)
         self.assertEqual(len(self.app.requests), 1)
 
     def test_truncated_attr_value(self):
@@ -1459,6 +1510,83 @@ class TestFormPost(unittest.TestCase):
         self.assertEqual(self.app.requests[0].body, b'Test File\nOne\n')
         self.assertEqual(self.app.requests[1].body, b'Test\nFile\nTwo\n')
 
+    def test_prefixed_and_not_prefixed_sigs_good(self):
+        def do_test(digest, prefixed):
+            key = b'abc'
+            sig, env, body = self._make_sig_env_body(
+                '/v1/AUTH_test/container', '', 1024, 10,
+                int(time() + 86400), key, algorithm=digest, prefix=prefixed)
+            env['wsgi.input'] = BytesIO(b'\r\n'.join(body))
+            env['swift.infocache'][get_cache_key('AUTH_test')] = (
+                self._fake_cache_env('AUTH_test', [key]))
+            env['swift.infocache'][get_cache_key(
+                'AUTH_test', 'container')] = {'meta': {}}
+            self.auth.app = app = FakeApp(iter([('201 Created', {}, b''),
+                                                ('201 Created', {}, b'')]))
+            status = [None]
+            headers = [None]
+            exc_info = [None]
+
+            def start_response(s, h, e=None):
+                status[0] = s
+                headers[0] = h
+                exc_info[0] = e
+
+            body = b''.join(self.formpost(env, start_response))
+            status = status[0]
+            headers = headers[0]
+            exc_info = exc_info[0]
+            self.assertEqual(status, '201 Created')
+            location = None
+            for h, v in headers:
+                if h.lower() == 'location':
+                    location = v
+            self.assertIsNone(location)
+            self.assertIsNone(exc_info)
+            self.assertTrue(b'201 Created' in body)
+            self.assertEqual(len(app.requests), 2)
+            self.assertEqual(app.requests[0].body, b'Test File\nOne\n')
+            self.assertEqual(app.requests[1].body, b'Test\nFile\nTwo\n')
+
+        for digest in ('sha1', 'sha256', 'sha512'):
+            do_test(digest, True)
+            do_test(digest, False)
+
+        # NB: one increment per *upload*, not client request
+        self.assertEqual(self.logger.get_increment_counts(), {
+            'formpost.digests.sha1': 4,
+            'formpost.digests.sha256': 4,
+            'formpost.digests.sha512': 4,
+        })
+
+    def test_prefixed_and_not_prefixed_sigs_unsupported(self):
+        def do_test(digest, prefixed):
+            key = b'abc'
+            sig, env, body = self._make_sig_env_body(
+                '/v1/AUTH_test/container', '', 1024, 10,
+                int(time() + 86400), key, algorithm=digest, prefix=prefixed)
+            env['wsgi.input'] = BytesIO(b'\r\n'.join(body))
+            env['swift.infocache'][get_cache_key('AUTH_test')] = (
+                self._fake_cache_env('AUTH_test', [key]))
+            env['swift.infocache'][get_cache_key(
+                'AUTH_test', 'container')] = {'meta': {}}
+            self.app = FakeApp(iter([('201 Created', {}, b''),
+                                     ('201 Created', {}, b'')]))
+            self.auth = tempauth.filter_factory({})(self.app)
+            self.formpost = formpost.filter_factory({})(self.auth)
+            status = [None]
+
+            def start_response(s, h, e=None):
+                status[0] = s
+
+            body = b''.join(self.formpost(env, start_response))
+            status = status[0]
+            self.assertEqual(status, '401 Unauthorized')
+
+        for digest in ('md5', 'sha224'):
+            do_test(digest, True)
+            do_test(digest, False)
+
     def test_no_redirect_expired(self):
         key = b'abc'
         sig, env, body = self._make_sig_env_body(
@@ -1558,6 +1686,64 @@ class TestFormPost(unittest.TestCase):
         self.assertIsNone(location)
         self.assertIsNone(exc_info)
         self.assertTrue(b'FormPost: invalid starting boundary' in body)
+
+    def test_redirect_allowed_deprecated_and_unsupported_digests(self):
+        logger = debug_logger()
+
+        def do_test(digest):
+            logger.clear()
+            key = b'abc'
+            sig, env, body = self._make_sig_env_body(
+                '/v1/AUTH_test/container', 'http://redirect', 1024, 10,
+                int(time() + 86400), key, algorithm=digest)
+            env['wsgi.input'] = BytesIO(b'\r\n'.join(body))
+            env['swift.infocache'][get_cache_key('AUTH_test')] = (
+                self._fake_cache_env('AUTH_test', [key]))
+            env['swift.infocache'][get_cache_key(
+                'AUTH_test', 'container')] = {'meta': {}}
+            self.app = FakeApp(iter([('201 Created', {}, b''),
+                                     ('201 Created', {}, b'')]))
+            self.auth = tempauth.filter_factory({})(self.app)
+            with mock.patch('swift.common.middleware.formpost.get_logger',
+                            return_value=logger):
+                self.formpost = formpost.filter_factory(
+                    {
+                        'allowed_digests': DEFAULT_ALLOWED_DIGESTS})(self.auth)
+            status = [None]
+            headers = [None]
+            exc_info = [None]
+
+            def start_response(s, h, e=None):
+                status[0] = s
+                headers[0] = h
+                exc_info[0] = e
+
+            body = b''.join(self.formpost(env, start_response))
+            return body, status[0], headers[0], exc_info[0]
+
+        for algorithm in ('sha1', 'sha256', 'sha512'):
+            body, status, headers, exc_info = do_test(algorithm)
+            self.assertEqual(status, '303 See Other')
+            location = None
+            for h, v in headers:
+                if h.lower() == 'location':
+                    location = v
+            self.assertEqual(location, 'http://redirect?status=201&message=')
+            self.assertIsNone(exc_info)
+            self.assertTrue(location.encode('utf-8') in body)
+            self.assertEqual(len(self.app.requests), 2)
+            self.assertEqual(self.app.requests[0].body, b'Test File\nOne\n')
+            self.assertEqual(self.app.requests[1].body, b'Test\nFile\nTwo\n')
+            if algorithm in digest_utils.DEPRECATED_DIGESTS:
+                self.assertIn(
+                    'The following digest algorithms are configured but '
+                    'deprecated: %s. Support will be removed in a '
+                    'future release.' % algorithm,
+                    logger.get_lines_for_level('warning'))
+
+        # unsupported
+        _body, status, _headers, _exc_info = do_test("md5")
+        self.assertEqual(status, '401 Unauthorized')
 
     def test_no_v1(self):
         key = b'abc'
@@ -2035,6 +2221,121 @@ class TestFormPost(unittest.TestCase):
         self.assertIn("Content-Encoding", self.app.requests[1].headers)
         self.assertEqual("gzip",
                          self.app.requests[1].headers["Content-Encoding"])
+
+    def test_multiple_content_type_encoding(self):
+        body_part = [
+            '------WebKitFormBoundaryNcxTqxSlX7t4TDkR',
+            'Content-Disposition: form-data; name="file4"; '
+            'filename="testfile4.txt"',
+            'Content-Type: application/json',
+            '',
+            '{"four": 4}\n',
+        ]
+        if six.PY3:
+            body_part = [line.encode('utf-8') for line in body_part]
+
+        key = b'abc'
+        sig, env, body = self._make_sig_env_body(
+            '/v1/AUTH_test/container', '', 1024, 10, int(time() + 86400), key)
+        # splice in another file with a different content type
+        before_closing_boundary = len(body) - 2
+        body[before_closing_boundary:before_closing_boundary] = body_part
+        wsgi_input = b'\r\n'.join(body)
+        env['wsgi.input'] = BytesIO(wsgi_input)
+
+        env['swift.infocache'][get_cache_key('AUTH_test')] = (
+            self._fake_cache_env('AUTH_test', [key]))
+        env['swift.infocache'][get_cache_key(
+            'AUTH_test', 'container')] = {'meta': {}}
+        self.app = FakeApp(iter([('201 Created', {}, b'')] * 3))
+        self.auth = tempauth.filter_factory({})(self.app)
+        self.formpost = formpost.filter_factory({})(self.auth)
+        status = [None]
+        headers = [None]
+
+        def start_response(s, h, e=None):
+            status[0] = s
+            headers[0] = h
+
+        body = b''.join(self.formpost(env, start_response))
+        status = status[0]
+        headers = headers[0]
+        self.assertEqual(status, '201 Created')
+        self.assertTrue(b'201 Created' in body)
+
+        self.assertEqual(len(self.app.requests), 3)
+        self.assertEqual(self.app.requests[0].body, b'Test File\nOne\n')
+        self.assertEqual(self.app.requests[1].body, b'Test\nFile\nTwo\n')
+        self.assertEqual(self.app.requests[2].body, b'{"four": 4}\n')
+
+        self.assertIn("Content-Type", self.app.requests[0].headers)
+        self.assertIn("Content-Type", self.app.requests[1].headers)
+        self.assertIn("Content-Type", self.app.requests[2].headers)
+        self.assertEqual("text/plain",
+                         self.app.requests[0].headers["Content-Type"])
+        self.assertEqual("text/plain",
+                         self.app.requests[1].headers["Content-Type"])
+        self.assertEqual("application/json",
+                         self.app.requests[2].headers["Content-Type"])
+
+        self.assertFalse("Content-Encoding" in self.app.requests[0].headers)
+        self.assertIn("Content-Encoding", self.app.requests[1].headers)
+        self.assertEqual("gzip",
+                         self.app.requests[1].headers["Content-Encoding"])
+        self.assertFalse("Content-Encoding" in self.app.requests[2].headers)
+
+
+class TestSwiftInfo(unittest.TestCase):
+    def setUp(self):
+        registry._swift_info = {}
+        registry._swift_admin_info = {}
+
+    def test_registered_defaults(self):
+        formpost.filter_factory({})
+        swift_info = registry.get_swift_info()
+        self.assertIn('formpost', swift_info)
+        info = swift_info['formpost']
+        self.assertIn('allowed_digests', info)
+        self.assertIn('deprecated_digests', info)
+        self.assertEqual(info['allowed_digests'], ['sha1', 'sha256', 'sha512'])
+        self.assertEqual(info['deprecated_digests'], ['sha1'])
+
+    def test_non_default_methods(self):
+        logger = debug_logger()
+        with mock.patch('swift.common.middleware.formpost.get_logger',
+                        return_value=logger):
+            formpost.filter_factory({
+                'allowed_digests': 'sha1 sha512 md5 not-a-valid-digest',
+            })
+        swift_info = registry.get_swift_info()
+        self.assertIn('formpost', swift_info)
+        info = swift_info['formpost']
+        self.assertIn('allowed_digests', info)
+        self.assertIn('deprecated_digests', info)
+        self.assertEqual(info['allowed_digests'], ['sha1', 'sha512'])
+        self.assertEqual(info['deprecated_digests'], ['sha1'])
+        warning_lines = logger.get_lines_for_level('warning')
+        self.assertIn(
+            'The following digest algorithms are configured '
+            'but not supported:',
+            warning_lines[0])
+        self.assertIn('not-a-valid-digest', warning_lines[0])
+        self.assertIn('md5', warning_lines[0])
+
+    def test_no_deprecated_digests(self):
+        formpost.filter_factory({'allowed_digests': 'sha256 sha512'})
+        swift_info = registry.get_swift_info()
+        self.assertIn('formpost', swift_info)
+        info = swift_info['formpost']
+        self.assertIn('allowed_digests', info)
+        self.assertNotIn('deprecated_digests', info)
+        self.assertEqual(info['allowed_digests'], ['sha256', 'sha512'])
+
+    def test_bad_config(self):
+        with self.assertRaises(ValueError):
+            formpost.filter_factory({
+                'allowed_digests': 'md4',
+            })
 
 
 if __name__ == '__main__':

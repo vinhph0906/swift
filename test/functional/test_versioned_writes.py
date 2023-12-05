@@ -20,12 +20,13 @@ import time
 import unittest
 import six
 from six.moves.urllib.parse import quote, unquote
+from unittest import SkipTest
 
 import test.functional as tf
 
 from swift.common.utils import MD5_OF_EMPTY_STRING
 from test.functional.tests import Base, Base2, BaseEnv, Utils
-from test.functional import cluster_info, SkipTest
+from test.functional import cluster_info
 from test.functional.swift_test_client import Account, Connection, \
     ResponseError
 
@@ -1135,6 +1136,11 @@ class TestSloWithVersioningUTF8(Base2, TestSloWithVersioning):
 
 class TestObjectVersioningChangingMode(Base):
     env = TestObjectVersioningHistoryModeEnv
+
+    def setUp(self):
+        super(TestObjectVersioningChangingMode, self).setUp()
+        if 'versioned_writes' not in cluster_info:
+            raise SkipTest("versioned_writes not enabled")
 
     def test_delete_while_changing_mode(self):
         container = self.env.container

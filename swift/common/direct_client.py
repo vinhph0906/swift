@@ -27,8 +27,10 @@ import six
 import six.moves.cPickle as pickle
 from six.moves.http_client import HTTPException
 
-from swift.common.bufferedhttp import http_connect
+from swift.common.bufferedhttp import http_connect, http_connect_raw
 from swift.common.exceptions import ClientException
+from swift.common.request_helpers import USE_REPLICATION_NETWORK_HEADER, \
+    get_ip_port
 from swift.common.swob import normalize_etag
 from swift.common.utils import Timestamp, FileLikeIter, quote
 from swift.common.http import HTTP_NO_CONTENT, HTTP_INSUFFICIENT_STORAGE, \
@@ -52,6 +54,20 @@ class DirectClientException(ClientException):
             msg, http_host=host['ip'], http_port=host['port'],
             http_device=node['device'], http_status=resp.status,
             http_reason=resp.reason, http_headers=headers)
+
+
+class DirectClientReconException(ClientException):
+
+    def __init__(self, method, node, path, resp):
+        if not isinstance(path, six.text_type):
+            path = path.decode("utf-8")
+        msg = 'server %s:%s direct %s %r gave status %s' % (
+            node['ip'], node['port'], method, path, resp.status)
+        headers = HeaderKeyDict(resp.getheaders())
+        super(DirectClientReconException, self).__init__(
+            msg, http_host=node['ip'], http_port=node['port'],
+            http_status=resp.status, http_reason=resp.reason,
+            http_headers=headers)
 
 
 def _make_path(*components):
@@ -100,9 +116,10 @@ def _make_req(node, part, method, path, headers, stype,
         if content_length is None:
             headers['Transfer-Encoding'] = 'chunked'
 
+    ip, port = get_ip_port(node, headers)
     headers.setdefault('X-Backend-Allow-Reserved-Names', 'true')
     with Timeout(conn_timeout):
-        conn = http_connect(node['ip'], node['port'], node['device'], part,
+        conn = http_connect(ip, port, node['device'], part,
                             method, path, headers=headers)
 
     if contents is not None:
@@ -145,6 +162,9 @@ def _get_direct_account_container(path, stype, node, part,
     Do not use directly use the get_direct_account or
     get_direct_container instead.
     """
+    if headers is None:
+        headers = {}
+
     params = ['format=json']
     if marker:
         params.append('marker=%s' % quote(marker))
@@ -159,8 +179,10 @@ def _get_direct_account_container(path, stype, node, part,
     if reverse:
         params.append('reverse=%s' % quote(reverse))
     qs = '&'.join(params)
+
+    ip, port = get_ip_port(node, headers)
     with Timeout(conn_timeout):
-        conn = http_connect(node['ip'], node['port'], node['device'], part,
+        conn = http_connect(ip, port, node['device'], part,
                             'GET', path, query_string=qs,
                             headers=gen_headers(hdrs_in=headers))
     with Timeout(response_timeout):
@@ -200,7 +222,8 @@ def gen_headers(hdrs_in=None, add_ts=True):
 
 def direct_get_account(node, part, account, marker=None, limit=None,
                        prefix=None, delimiter=None, conn_timeout=5,
-                       response_timeout=15, end_marker=None, reverse=None):
+                       response_timeout=15, end_marker=None, reverse=None,
+                       headers=None):
     """
     Get listings directly from the account server.
 
@@ -220,6 +243,7 @@ def direct_get_account(node, part, account, marker=None, limit=None,
     """
     path = _make_path(account)
     return _get_direct_account_container(path, "Account", node, part,
+                                         headers=headers,
                                          marker=marker,
                                          limit=limit, prefix=prefix,
                                          delimiter=delimiter,
@@ -240,7 +264,7 @@ def direct_delete_account(node, part, account, conn_timeout=5,
 
 
 def direct_head_container(node, part, account, container, conn_timeout=5,
-                          response_timeout=15):
+                          response_timeout=15, headers=None):
     """
     Request container information directly from the container server.
 
@@ -253,8 +277,11 @@ def direct_head_container(node, part, account, container, conn_timeout=5,
     :returns: a dict containing the response's headers in a HeaderKeyDict
     :raises ClientException: HTTP HEAD request failed
     """
+    if headers is None:
+        headers = {}
+
     path = _make_path(account, container)
-    resp = _make_req(node, part, 'HEAD', path, gen_headers(),
+    resp = _make_req(node, part, 'HEAD', path, gen_headers(headers),
                      'Container', conn_timeout, response_timeout)
 
     resp_headers = HeaderKeyDict()
@@ -431,9 +458,10 @@ def direct_get_object(node, part, account, container, obj, conn_timeout=5,
     if headers is None:
         headers = {}
 
+    ip, port = get_ip_port(node, headers)
     path = _make_path(account, container, obj)
     with Timeout(conn_timeout):
-        conn = http_connect(node['ip'], node['port'], node['device'], part,
+        conn = http_connect(ip, port, node['device'], part,
                             'GET', path, headers=gen_headers(headers))
     with Timeout(response_timeout):
         resp = conn.getresponse()
@@ -551,6 +579,9 @@ def direct_get_suffix_hashes(node, part, suffixes, conn_timeout=5,
     """
     Get suffix hashes directly from the object server.
 
+    Note that unlike other ``direct_client`` functions, this one defaults
+    to using the replication network to make requests.
+
     :param node: node dictionary from the ring
     :param part: partition the container is on
     :param conn_timeout: timeout in seconds for establishing the connection
@@ -562,9 +593,11 @@ def direct_get_suffix_hashes(node, part, suffixes, conn_timeout=5,
     if headers is None:
         headers = {}
 
+    headers.setdefault(USE_REPLICATION_NETWORK_HEADER, 'true')
+    ip, port = get_ip_port(node, headers)
     path = '/%s' % '-'.join(suffixes)
     with Timeout(conn_timeout):
-        conn = http_connect(node['replication_ip'], node['replication_port'],
+        conn = http_connect(ip, port,
                             node['device'], part, 'REPLICATE', path,
                             headers=gen_headers(headers))
     with Timeout(response_timeout):
@@ -621,3 +654,31 @@ def retry(func, *args, **kwargs):
                               http_device=args[0]['device'])
     else:
         raise ClientException('Raise too many retries')
+
+
+def direct_get_recon(node, recon_command, conn_timeout=5, response_timeout=15,
+                     headers=None):
+    """
+    Get recon json directly from the storage server.
+
+    :param node: node dictionary from the ring
+    :param recon_command: recon string (post /recon/)
+    :param conn_timeout: timeout in seconds for establishing the connection
+    :param response_timeout: timeout in seconds for getting the response
+    :param headers: dict to be passed into HTTPConnection headers
+    :returns: deserialized json response
+    :raises DirectClientReconException: HTTP GET request failed
+    """
+    if headers is None:
+        headers = {}
+
+    ip, port = get_ip_port(node, headers)
+    path = '/recon/%s' % recon_command
+    with Timeout(conn_timeout):
+        conn = http_connect_raw(ip, port, 'GET', path,
+                                headers=gen_headers(headers))
+    with Timeout(response_timeout):
+        resp = conn.getresponse()
+    if not is_success(resp.status):
+        raise DirectClientReconException('GET', node, path, resp)
+    return json.loads(resp.read())

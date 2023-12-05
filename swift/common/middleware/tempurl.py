@@ -64,7 +64,7 @@ signature is generated using the HTTP method to allow (``GET``, ``PUT``,
 the full path to the object, and the key set on the account.
 
 The digest algorithm to be used may be configured by the operator. By default,
-HMAC-SHA1, HMAC-SHA256, and HMAC-SHA512 are supported. Check the
+HMAC-SHA256 and HMAC-SHA512 are supported. Check the
 ``tempurl.allowed_digests`` entry in the cluster's capabilities response to
 see which algorithms are supported by your deployment; see
 :doc:`api/discoverability` for more information. On older clusters,
@@ -75,24 +75,25 @@ For example, here is code generating the signature for a ``GET`` for 60
 seconds on ``/v1/AUTH_account/container/object``::
 
     import hmac
-    from hashlib import sha1
+    from hashlib import sha256
     from time import time
     method = 'GET'
     expires = int(time() + 60)
     path = '/v1/AUTH_account/container/object'
     key = 'mykey'
     hmac_body = '%s\n%s\n%s' % (method, expires, path)
-    sig = hmac.new(key, hmac_body, sha1).hexdigest()
+    sig = hmac.new(key, hmac_body, sha256).hexdigest()
 
 Be certain to use the full path, from the ``/v1/`` onward.
 
 Let's say ``sig`` ends up equaling
-``da39a3ee5e6b4b0d3255bfef95601890afd80709`` and ``expires`` ends up
-``1323479485``. Then, for example, the website could provide a link to::
+``732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b`` and
+``expires`` ends up ``1512508563``. Then, for example, the website could
+provide a link to::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563
 
 For longer hashes, a hex encoding becomes unwieldy. Base64 encoding is also
 supported, and indicated by prefixing the signature with ``"<digest name>:"``.
@@ -124,11 +125,11 @@ Supposing that ``sig`` ends up equaling
 You may also use ISO 8601 UTC timestamps with the format
 ``"%Y-%m-%dT%H:%M:%SZ"`` instead of UNIX timestamps in the URL
 (but NOT in the code above for generating the signature!).
-So, the above HMAC-SHA1 URL could also be formulated as::
+So, the above HMAC-SHA246 URL could also be formulated as::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=2011-12-10T01:11:25Z
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=2017-12-05T21:16:03Z
 
 If a prefix-based signature with the prefix ``pre`` is desired, set path to::
 
@@ -140,31 +141,31 @@ a query parameter called ``temp_url_prefix``. So, if ``sig`` and ``expires``
 would end up like above, following URL would be valid::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/pre/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563&
     temp_url_prefix=pre
 
 Another valid URL::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/pre/
     subfolder/another_object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563&
     temp_url_prefix=pre
 
 If you wish to lock down the ip ranges from where the resource can be accessed
 to the ip ``1.2.3.4``::
 
     import hmac
-    from hashlib import sha1
+    from hashlib import sha256
     from time import time
     method = 'GET'
     expires = int(time() + 60)
     path = '/v1/AUTH_account/container/object'
     ip_range = '1.2.3.4'
-    key = 'mykey'
+    key = b'mykey'
     hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip_range, method, expires, path)
-    sig = hmac.new(key, hmac_body, sha1).hexdigest()
+    sig = hmac.new(key, hmac_body.encode('ascii'), sha256).hexdigest()
 
 The generated signature would only be valid from the ip ``1.2.3.4``. The
 middleware detects an ip-based temporary URL by a query parameter called
@@ -172,29 +173,29 @@ middleware detects an ip-based temporary URL by a query parameter called
 above, following URL would be valid::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&
+    temp_url_sig=3f48476acaf5ec272acd8e99f7b5bad96c52ddba53ed27c60613711774a06f0c&
+    temp_url_expires=1648082711&
     temp_url_ip_range=1.2.3.4
 
 Similarly to lock down the ip to a range of ``1.2.3.X`` so starting
 from the ip ``1.2.3.0`` to ``1.2.3.255``::
 
     import hmac
-    from hashlib import sha1
+    from hashlib import sha256
     from time import time
     method = 'GET'
     expires = int(time() + 60)
     path = '/v1/AUTH_account/container/object'
     ip_range = '1.2.3.0/24'
-    key = 'mykey'
+    key = b'mykey'
     hmac_body = 'ip=%s\n%s\n%s\n%s' % (ip_range, method, expires, path)
-    sig = hmac.new(key, hmac_body, sha1).hexdigest()
+    sig = hmac.new(key, hmac_body.encode('ascii'), sha256).hexdigest()
 
 Then the following url would be valid::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&
+    temp_url_sig=6ff81256b8a3ba11d239da51a703b9c06a56ffddeb8caab74ca83af8f73c9c83&
+    temp_url_expires=1648082711&
     temp_url_ip_range=1.2.3.0/24
 
 
@@ -222,16 +223,16 @@ can override this with a filename query parameter. Modifying the
 above example::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&filename=My+Test+File.pdf
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563&filename=My+Test+File.pdf
 
 If you do not want the object to be downloaded, you can cause
 ``Content-Disposition: inline`` to be set on the response by adding the
 ``inline`` parameter to the query string, like so::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&inline
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563&inline
 
 In some cases, the client might not able to present the content of the object,
 but you still want the content able to save to local with the specific
@@ -240,8 +241,8 @@ set on the response by adding the ``inline&filename=...`` parameter to the
 query string, like so::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object?
-    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
-    temp_url_expires=1323479485&inline&filename=My+Test+File.pdf
+    temp_url_sig=732fcac368abb10c78a4cbe95c3fab7f311584532bf779abd5074e13cbe8b88b&
+    temp_url_expires=1512508563&inline&filename=My+Test+File.pdf
 
 ---------------------
 Cluster Configuration
@@ -288,7 +289,7 @@ This middleware understands the following configuration settings:
     A whitespace delimited list of digest algorithms that are allowed
     to be used when calculating the signature for a temporary URL.
 
-    Default: ``sha1 sha256 sha512``
+    Default: ``sha256 sha512``
 """
 
 __all__ = ['TempURL', 'filter_factory',
@@ -297,10 +298,7 @@ __all__ = ['TempURL', 'filter_factory',
            'DEFAULT_OUTGOING_REMOVE_HEADERS',
            'DEFAULT_OUTGOING_ALLOW_HEADERS']
 
-import binascii
 from calendar import timegm
-import functools
-import hashlib
 import six
 from os.path import basename
 from time import time, strftime, strptime, gmtime
@@ -311,11 +309,13 @@ from six.moves.urllib.parse import urlencode
 
 from swift.proxy.controllers.base import get_account_info, get_container_info
 from swift.common.header_key_dict import HeaderKeyDict
+from swift.common.digest import get_allowed_digests, \
+    extract_digest_and_algorithm, DEFAULT_ALLOWED_DIGESTS, get_hmac
 from swift.common.swob import header_to_environ_key, HTTPUnauthorized, \
     HTTPBadRequest, wsgi_to_str
 from swift.common.utils import split_path, get_valid_utf8_str, \
-    register_swift_info, get_hmac, streq_const_time, quote, get_logger, \
-    strict_b64decode
+    streq_const_time, quote, get_logger
+from swift.common.registry import register_swift_info, register_sensitive_param
 
 
 DISALLOWED_INCOMING_HEADERS = 'x-object-manifest x-symlink-target'
@@ -341,9 +341,6 @@ DEFAULT_OUTGOING_REMOVE_HEADERS = 'x-object-meta-*'
 #: whitespace delimited list of header names and names can optionally end with
 #: '*' to indicate a prefix match.
 DEFAULT_OUTGOING_ALLOW_HEADERS = 'x-object-meta-public-*'
-
-DEFAULT_ALLOWED_DIGESTS = 'sha1 sha256 sha512'
-SUPPORTED_DIGESTS = set(DEFAULT_ALLOWED_DIGESTS.split())
 
 CONTAINER_SCOPE = 'container'
 ACCOUNT_SCOPE = 'account'
@@ -424,11 +421,12 @@ class TempURL(object):
     :param conf: The configuration dict for the middleware.
     """
 
-    def __init__(self, app, conf):
+    def __init__(self, app, conf, logger=None):
         #: The next WSGI application/filter in the paste.deploy pipeline.
         self.app = app
         #: The filter configuration dict.
         self.conf = conf
+        self.logger = logger or get_logger(conf, log_route='tempurl')
 
         self.allowed_digests = conf.get(
             'allowed_digests', DEFAULT_ALLOWED_DIGESTS.split())
@@ -498,30 +496,17 @@ class TempURL(object):
         if env['REQUEST_METHOD'] == 'OPTIONS':
             return self.app(env, start_response)
         info = self._get_temp_url_info(env)
-        temp_url_sig, temp_url_expires, temp_url_prefix, filename,\
+        temp_url_sig, temp_url_expires, temp_url_prefix, filename, \
             inline_disposition, temp_url_ip_range = info
         if temp_url_sig is None and temp_url_expires is None:
             return self.app(env, start_response)
         if not temp_url_sig or not temp_url_expires:
             return self._invalid(env, start_response)
 
-        if ':' in temp_url_sig:
-            hash_algorithm, temp_url_sig = temp_url_sig.split(':', 1)
-            if ('-' in temp_url_sig or '_' in temp_url_sig) and not (
-                    '+' in temp_url_sig or '/' in temp_url_sig):
-                temp_url_sig = temp_url_sig.replace('-', '+').replace('_', '/')
-            try:
-                temp_url_sig = binascii.hexlify(strict_b64decode(
-                    temp_url_sig + '=='))
-                if not six.PY2:
-                    temp_url_sig = temp_url_sig.decode('ascii')
-            except ValueError:
-                return self._invalid(env, start_response)
-        elif len(temp_url_sig) == 40:
-            hash_algorithm = 'sha1'
-        elif len(temp_url_sig) == 64:
-            hash_algorithm = 'sha256'
-        else:
+        try:
+            hash_algorithm, temp_url_sig = extract_digest_and_algorithm(
+                temp_url_sig)
+        except ValueError:
             return self._invalid(env, start_response)
         if hash_algorithm not in self.allowed_digests:
             return self._invalid(env, start_response)
@@ -574,6 +559,7 @@ class TempURL(object):
                 break
         if not is_valid_hmac:
             return self._invalid(env, start_response)
+        self.logger.increment('tempurl.digests.%s' % hash_algorithm)
         # disallowed headers prevent accidentally allowing upload of a pointer
         # to data that the PUT tempurl would not otherwise allow access for.
         # It should be safe to provide a GET tempurl for data that an
@@ -750,12 +736,10 @@ class TempURL(object):
         if not request_method:
             request_method = env['REQUEST_METHOD']
 
-        digest = functools.partial(hashlib.new, hash_algorithm)
-
         return [
             (get_hmac(
                 request_method, path, expires, key,
-                digest=digest, ip_range=ip_range
+                digest=hash_algorithm, ip_range=ip_range
             ), scope)
             for (key, scope) in scoped_keys]
 
@@ -839,7 +823,7 @@ class TempURL(object):
                     if h.startswith(p):
                         del headers[h]
                         break
-        return headers.items()
+        return list(headers.items())
 
 
 def filter_factory(global_conf, **local_conf):
@@ -847,30 +831,26 @@ def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
 
+    logger = get_logger(conf, log_route='tempurl')
+
     defaults = {
         'methods': 'GET HEAD PUT POST DELETE',
         'incoming_remove_headers': DEFAULT_INCOMING_REMOVE_HEADERS,
         'incoming_allow_headers': DEFAULT_INCOMING_ALLOW_HEADERS,
         'outgoing_remove_headers': DEFAULT_OUTGOING_REMOVE_HEADERS,
         'outgoing_allow_headers': DEFAULT_OUTGOING_ALLOW_HEADERS,
-        'allowed_digests': DEFAULT_ALLOWED_DIGESTS,
     }
     info_conf = {k: conf.get(k, v).split() for k, v in defaults.items()}
 
-    allowed_digests = set(digest.lower()
-                          for digest in info_conf['allowed_digests'])
-    not_supported = allowed_digests - SUPPORTED_DIGESTS
-    if not_supported:
-        logger = get_logger(conf, log_route='tempurl')
-        logger.warning('The following digest algorithms are configured but '
-                       'not supported: %s', ', '.join(not_supported))
-        allowed_digests -= not_supported
-    if not allowed_digests:
-        raise ValueError('No valid digest algorithms are configured '
-                         'for tempurls')
+    allowed_digests, deprecated_digests = get_allowed_digests(
+        conf.get('allowed_digests', '').split(), logger)
     info_conf['allowed_digests'] = sorted(allowed_digests)
+    if deprecated_digests:
+        info_conf['deprecated_digests'] = sorted(deprecated_digests)
 
     register_swift_info('tempurl', **info_conf)
     conf.update(info_conf)
 
-    return lambda app: TempURL(app, conf)
+    register_sensitive_param('temp_url_sig')
+
+    return lambda app: TempURL(app, conf, logger)

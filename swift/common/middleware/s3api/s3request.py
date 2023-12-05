@@ -17,7 +17,7 @@ import base64
 import binascii
 from collections import defaultdict, OrderedDict
 from email.header import Header
-from hashlib import sha1, sha256, md5
+from hashlib import sha1, sha256
 import hmac
 import re
 import six
@@ -25,8 +25,9 @@ import six
 from six.moves.urllib.parse import quote, unquote, parse_qsl
 import string
 
-from swift.common.utils import split_path, json, get_swift_info, \
-    close_if_possible
+from swift.common.utils import split_path, json, close_if_possible, md5, \
+    streq_const_time
+from swift.common.registry import get_swift_info
 from swift.common import swob
 from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     HTTP_NO_CONTENT, HTTP_UNAUTHORIZED, HTTP_FORBIDDEN, HTTP_NOT_FOUND, \
@@ -34,18 +35,19 @@ from swift.common.http import HTTP_OK, HTTP_CREATED, HTTP_ACCEPTED, \
     HTTP_PARTIAL_CONTENT, HTTP_NOT_MODIFIED, HTTP_PRECONDITION_FAILED, \
     HTTP_REQUESTED_RANGE_NOT_SATISFIABLE, HTTP_LENGTH_REQUIRED, \
     HTTP_BAD_REQUEST, HTTP_REQUEST_TIMEOUT, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_TOO_MANY_REQUESTS, HTTP_RATE_LIMITED, is_success
+    HTTP_TOO_MANY_REQUESTS, HTTP_RATE_LIMITED, is_success, \
+    HTTP_CLIENT_CLOSED_REQUEST
 
 from swift.common.constraints import check_utf8
-from swift.proxy.controllers.base import get_container_info, \
-    headers_to_container_info
+from swift.proxy.controllers.base import get_container_info
 from swift.common.request_helpers import check_path_header
 
 from swift.common.middleware.s3api.controllers import ServiceController, \
     ObjectController, AclController, MultiObjectDeleteController, \
     LocationController, LoggingStatusController, PartController, \
     UploadController, UploadsController, VersioningController, \
-    UnsupportedController, S3AclController, BucketController
+    UnsupportedController, S3AclController, BucketController, \
+    TaggingController
 from swift.common.middleware.s3api.s3response import AccessDenied, \
     InvalidArgument, InvalidDigest, BucketAlreadyOwnedByYou, \
     RequestTimeTooSkewed, S3Response, SignatureDoesNotMatch, \
@@ -54,14 +56,13 @@ from swift.common.middleware.s3api.s3response import AccessDenied, \
     MissingContentLength, InvalidStorageClass, S3NotImplemented, InvalidURI, \
     MalformedXML, InvalidRequest, RequestTimeout, InvalidBucketName, \
     BadDigest, AuthorizationHeaderMalformed, SlowDown, \
-    AuthorizationQueryParametersError, ServiceUnavailable
-from swift.common.middleware.s3api.exception import NotS3Request, \
-    BadSwiftRequest
+    AuthorizationQueryParametersError, ServiceUnavailable, BrokenMPU
+from swift.common.middleware.s3api.exception import NotS3Request
 from swift.common.middleware.s3api.utils import utf8encode, \
     S3Timestamp, mktime, MULTIUPLOAD_SUFFIX
 from swift.common.middleware.s3api.subresource import decode_acl, encode_acl
 from swift.common.middleware.s3api.utils import sysmeta_header, \
-    validate_bucket_name
+    validate_bucket_name, Config
 from swift.common.middleware.s3api.acl_utils import handle_acl_header
 
 
@@ -159,7 +160,7 @@ class SigV4Mixin(object):
                 derived_secret, scope_piece.encode('utf8'), sha256).digest()
         valid_signature = hmac.new(
             derived_secret, self.string_to_sign, sha256).hexdigest()
-        return user_signature == valid_signature
+        return streq_const_time(user_signature, valid_signature)
 
     @property
     def _is_query_auth(self):
@@ -283,6 +284,12 @@ class SigV4Mixin(object):
             if cred_param[key] != self.scope[key]:
                 kwargs = {}
                 if key == 'region':
+                    # Allow lowercase region name
+                    # for AWS .NET SDK compatibility
+                    if not self.scope[key].islower() and \
+                            cred_param[key] == self.scope[key].lower():
+                        self.location = self.location.lower()
+                        continue
                     kwargs = {'region': self.scope['region']}
                 raise AuthorizationQueryParametersError(
                     invalid_messages[key] % (cred_param[key], self.scope[key]),
@@ -325,6 +332,12 @@ class SigV4Mixin(object):
             if cred_param[key] != self.scope[key]:
                 kwargs = {}
                 if key == 'region':
+                    # Allow lowercase region name
+                    # for AWS .NET SDK compatibility
+                    if not self.scope[key].islower() and \
+                            cred_param[key] == self.scope[key].lower():
+                        self.location = self.location.lower()
+                        continue
                     kwargs = {'region': self.scope['region']}
                 raise AuthorizationHeaderMalformed(
                     invalid_messages[key] % (cred_param[key], self.scope[key]),
@@ -388,7 +401,8 @@ class SigV4Mixin(object):
         """
         It won't require bucket name in canonical_uri for v4.
         """
-        return swob.wsgi_to_bytes(self.environ.get('RAW_PATH_INFO', self.path))
+        return swob.wsgi_to_bytes(swob.wsgi_quote(
+            self.environ.get('PATH_INFO', self.path), safe='-_.~/'))
 
     def _canonical_request(self):
         # prepare 'canonical_request'
@@ -439,7 +453,7 @@ class SigV4Mixin(object):
             hashed_payload = self.headers['X-Amz-Content-SHA256']
             if hashed_payload != 'UNSIGNED-PAYLOAD':
                 if self.content_length == 0:
-                    if hashed_payload != sha256().hexdigest():
+                    if hashed_payload.lower() != sha256().hexdigest():
                         raise BadDigest(
                             'The X-Amz-Content-SHA56 you specified did not '
                             'match what we received.')
@@ -448,7 +462,7 @@ class SigV4Mixin(object):
                         self.environ['wsgi.input'],
                         self.content_length,
                         sha256,
-                        hashed_payload)
+                        hashed_payload.lower())
                 # else, length not provided -- Swift will kick out a
                 # 411 Length Required which will get translated back
                 # to a S3-style response in S3Request._swift_error_codes
@@ -513,18 +527,11 @@ class S3Request(swob.Request):
     bucket_acl = _header_acl_property('container')
     object_acl = _header_acl_property('object')
 
-    def __init__(self, env, app=None, slo_enabled=True, storage_domain='',
-                 location='us-east-1', force_request_log=False,
-                 dns_compliant_bucket_names=True, allow_multipart_uploads=True,
-                 allow_no_owner=False):
-        # NOTE: app and allow_no_owner are not used by this class, need for
-        #       compatibility of S3acl
+    def __init__(self, env, app=None, conf=None):
+        # NOTE: app is not used by this class, need for compatibility of S3acl
         swob.Request.__init__(self, env)
-        self.storage_domain = storage_domain
-        self.location = location
-        self.force_request_log = force_request_log
-        self.dns_compliant_bucket_names = dns_compliant_bucket_names
-        self.allow_multipart_uploads = allow_multipart_uploads
+        self.conf = conf or Config()
+        self.location = self.conf.location
         self._timestamp = None
         self.access_key, self.signature = self._parse_auth_info()
         self.bucket_in_host = self._parse_host()
@@ -540,7 +547,6 @@ class S3Request(swob.Request):
         }
         self.account = None
         self.user_id = None
-        self.slo_enabled = slo_enabled
 
         # Avoids that swift.swob.Response replaces Location header value
         # by full URL when absolute path given. See swift.swob for more detail.
@@ -553,7 +559,7 @@ class S3Request(swob.Request):
             secret, self.string_to_sign, sha1).digest()).strip()
         if not six.PY2:
             valid_signature = valid_signature.decode('ascii')
-        return user_signature == valid_signature
+        return streq_const_time(user_signature, valid_signature)
 
     @property
     def timestamp(self):
@@ -598,12 +604,8 @@ class S3Request(swob.Request):
         return 'AWSAccessKeyId' in self.params
 
     def _parse_host(self):
-        storage_domain = self.storage_domain
-        if not storage_domain:
+        if not self.conf.storage_domains:
             return None
-
-        if not storage_domain.startswith('.'):
-            storage_domain = '.' + storage_domain
 
         if 'HTTP_HOST' in self.environ:
             given_domain = self.environ['HTTP_HOST']
@@ -611,16 +613,21 @@ class S3Request(swob.Request):
             given_domain = self.environ['SERVER_NAME']
         else:
             return None
-
         port = ''
         if ':' in given_domain:
             given_domain, port = given_domain.rsplit(':', 1)
-        if given_domain.endswith(storage_domain):
-            return given_domain[:-len(storage_domain)]
+
+        for storage_domain in self.conf.storage_domains:
+            if not storage_domain.startswith('.'):
+                storage_domain = '.' + storage_domain
+
+            if given_domain.endswith(storage_domain):
+                return given_domain[:-len(storage_domain)]
 
         return None
 
     def _parse_uri(self):
+        # NB: returns WSGI strings
         if not check_utf8(swob.wsgi_to_str(self.environ['PATH_INFO'])):
             raise InvalidURI(self.path)
 
@@ -631,10 +638,10 @@ class S3Request(swob.Request):
         bucket, obj = self.split_path(0, 2, True)
 
         if bucket and not validate_bucket_name(
-                bucket, self.dns_compliant_bucket_names):
+                bucket, self.conf.dns_compliant_bucket_names):
             # Ignore GET service case
             raise InvalidBucketName(bucket)
-        return (bucket, obj)
+        return bucket, obj
 
     def _parse_query_authentication(self):
         """
@@ -727,8 +734,8 @@ class S3Request(swob.Request):
 
         # If the standard date is too far ahead or behind, it is an
         # error
-        delta = 60 * 5
-        if abs(int(self.timestamp) - int(S3Timestamp.now())) > delta:
+        delta = abs(int(self.timestamp) - int(S3Timestamp.now()))
+        if delta > self.conf.allowable_clock_skew:
             raise RequestTimeTooSkewed()
 
     def _validate_headers(self):
@@ -749,7 +756,7 @@ class S3Request(swob.Request):
             try:
                 self.headers['ETag'] = binascii.b2a_hex(
                     binascii.a2b_base64(value))
-            except binascii.error:
+            except binascii.Error:
                 # incorrect padding, most likely
                 raise InvalidDigest(content_md5=value)
 
@@ -771,7 +778,6 @@ class S3Request(swob.Request):
                 raise InvalidArgument('x-amz-copy-source',
                                       self.headers['X-Amz-Copy-Source'],
                                       msg)
-
         if 'x-amz-metadata-directive' in self.headers:
             value = self.headers['x-amz-metadata-directive']
             if value not in ('COPY', 'REPLACE'):
@@ -841,7 +847,15 @@ class S3Request(swob.Request):
 
         if te or ml:
             # Limit the read similar to how SLO handles manifests
-            body = self.body_file.read(max_length)
+            try:
+                body = self.body_file.read(max_length)
+            except swob.HTTPException as err:
+                if err.status_int == HTTP_UNPROCESSABLE_ENTITY:
+                    # Special case for HashingInput check
+                    raise BadDigest(
+                        'The X-Amz-Content-SHA56 you specified did not '
+                        'match what we received.')
+                raise
         else:
             # No (or zero) Content-Length provided, and not chunked transfer;
             # no body. Assume zero-length, and enforce a required body below.
@@ -854,7 +868,8 @@ class S3Request(swob.Request):
             raise InvalidRequest('Missing required header for this request: '
                                  'Content-MD5')
 
-        digest = base64.b64encode(md5(body).digest()).strip().decode('ascii')
+        digest = base64.b64encode(md5(
+            body, usedforsecurity=False).digest()).strip().decode('ascii')
         if self.environ['HTTP_CONTENT_MD5'] != digest:
             raise BadDigest(content_md5=self.environ['HTTP_CONTENT_MD5'])
 
@@ -896,8 +911,11 @@ class S3Request(swob.Request):
         headers = swob.HeaderKeyDict()
         headers.update(self._copy_source_headers())
 
-        src_resp = self.get_response(app, 'HEAD', src_bucket, src_obj,
+        src_resp = self.get_response(app, 'HEAD', src_bucket,
+                                     swob.str_to_wsgi(src_obj),
                                      headers=headers, query=query)
+        # we can't let this HEAD req spoil our COPY
+        self.headers.pop('x-backend-storage-policy-index')
         if src_resp.status_int == 304:  # pylint: disable-msg=E1101
             raise PreconditionFailed()
 
@@ -1005,7 +1023,7 @@ class S3Request(swob.Request):
         if self.is_service_request:
             return ServiceController
 
-        if not self.slo_enabled:
+        if not self.conf.allow_multipart_uploads:
             multi_part = ['partNumber', 'uploadId', 'uploads']
             if len([p for p in multi_part if p in self.params]):
                 raise S3NotImplemented("Multi-part feature isn't support")
@@ -1026,9 +1044,11 @@ class S3Request(swob.Request):
             return UploadsController
         if 'versioning' in self.params:
             return VersioningController
+        if 'tagging' in self.params:
+            return TaggingController
 
         unsupported = ('notification', 'policy', 'requestPayment', 'torrent',
-                       'website', 'cors', 'tagging', 'restore')
+                       'website', 'cors', 'restore')
         if set(unsupported) & set(self.params):
             return UnsupportedController
 
@@ -1131,7 +1151,7 @@ class S3Request(swob.Request):
                     if key.startswith('HTTP_X_OBJECT_META_'):
                         del env[key]
 
-        if self.force_request_log:
+        if self.conf.force_swift_request_proxy_log:
             env['swift.proxy_access_log_made'] = False
         env['swift.source'] = 'S3'
         if method is not None:
@@ -1295,6 +1315,7 @@ class S3Request(swob.Request):
                     HTTP_LENGTH_REQUIRED: MissingContentLength,
                     HTTP_REQUEST_TIMEOUT: RequestTimeout,
                     HTTP_PRECONDITION_FAILED: PreconditionFailed,
+                    HTTP_CLIENT_CLOSED_REQUEST: RequestTimeout,
                 },
                 'POST': {
                     HTTP_NOT_FOUND: not_found_handler,
@@ -1334,10 +1355,12 @@ class S3Request(swob.Request):
                                             2, 3, True)
             # Propagate swift.backend_path in environ for middleware
             # in pipeline that need Swift PATH_INFO like ceilometermiddleware.
-            # Store PATH_INFO only the first time to ignore multipart requests.
-            if 'swift.backend_path' not in self.environ:
-                self.environ['swift.backend_path'] = \
-                    sw_resp.environ['PATH_INFO']
+            self.environ['s3api.backend_path'] = \
+                sw_resp.environ['PATH_INFO']
+            # Propogate backend headers back into our req headers for logging
+            for k, v in sw_req.headers.items():
+                if k.lower().startswith('x-backend-'):
+                    self.headers.setdefault(k, v)
 
         resp = S3Response.from_swift_resp(sw_resp)
         status = resp.status_int  # pylint: disable-msg=E1101
@@ -1368,11 +1391,23 @@ class S3Request(swob.Request):
                 error_codes[sw_resp.status_int]  # pylint: disable-msg=E1101
             if isinstance(err_resp, tuple):
                 raise err_resp[0](*err_resp[1:])
+            elif b'quota' in err_msg:
+                raise err_resp(err_msg)
             else:
                 raise err_resp()
 
         if status == HTTP_BAD_REQUEST:
-            raise BadSwiftRequest(err_msg.decode('utf8'))
+            err_str = err_msg.decode('utf8')
+            if 'X-Delete-At' in err_str:
+                raise InvalidArgument('X-Delete-At',
+                                      self.headers['X-Delete-At'],
+                                      err_str)
+            if 'X-Delete-After' in err_msg.decode('utf8'):
+                raise InvalidArgument('X-Delete-After',
+                                      self.headers['X-Delete-After'],
+                                      err_str)
+            else:
+                raise InvalidRequest(msg=err_str)
         if status == HTTP_UNAUTHORIZED:
             raise SignatureDoesNotMatch(
                 **self.signature_does_not_match_kwargs())
@@ -1381,7 +1416,12 @@ class S3Request(swob.Request):
         if status == HTTP_SERVICE_UNAVAILABLE:
             raise ServiceUnavailable()
         if status in (HTTP_RATE_LIMITED, HTTP_TOO_MANY_REQUESTS):
+            if self.conf.ratelimit_as_client_error:
+                raise SlowDown(status='429 Slow Down')
             raise SlowDown()
+        if resp.status_int == HTTP_CONFLICT:
+            # TODO: validate that this actually came up out of SLO
+            raise BrokenMPU()
 
         raise InternalError('unexpected status code %d' % status)
 
@@ -1436,28 +1476,33 @@ class S3Request(swob.Request):
         :raises: NoSuchBucket when the container doesn't exist
         :raises: InternalError when the request failed without 404
         """
-        if self.is_authenticated:
-            # if we have already authenticated, yes we can use the account
-            # name like as AUTH_xxx for performance efficiency
-            sw_req = self.to_swift_req(app, self.container_name, None)
-            info = get_container_info(sw_req.environ, app, swift_source='S3')
-            if is_success(info['status']):
-                return info
-            elif info['status'] == 404:
-                raise NoSuchBucket(self.container_name)
-            else:
-                raise InternalError(
-                    'unexpected status code %d' % info['status'])
+        if not self.is_authenticated:
+            sw_req = self.to_swift_req('TEST', None, None, body='')
+            # don't show log message of this request
+            sw_req.environ['swift.proxy_access_log_made'] = True
+
+            sw_resp = sw_req.get_response(app)
+
+            if not sw_req.remote_user:
+                raise SignatureDoesNotMatch(
+                    **self.signature_does_not_match_kwargs())
+
+            _, self.account, _ = split_path(sw_resp.environ['PATH_INFO'],
+                                            2, 3, True)
+        sw_req = self.to_swift_req(app, self.container_name, None)
+        info = get_container_info(sw_req.environ, app, swift_source='S3')
+        if is_success(info['status']):
+            return info
+        elif info['status'] == HTTP_NOT_FOUND:
+            raise NoSuchBucket(self.container_name)
+        elif info['status'] == HTTP_SERVICE_UNAVAILABLE:
+            raise ServiceUnavailable()
         else:
-            # otherwise we do naive HEAD request with the authentication
-            resp = self.get_response(app, 'HEAD', self.container_name, '')
-            headers = resp.sw_headers.copy()
-            headers.update(resp.sysmeta_headers)
-            return headers_to_container_info(
-                headers, resp.status_int)  # pylint: disable-msg=E1101
+            raise InternalError(
+                'unexpected status code %d' % info['status'])
 
     def gen_multipart_manifest_delete_query(self, app, obj=None, version=None):
-        if not self.allow_multipart_uploads:
+        if not self.conf.allow_multipart_uploads:
             return {}
         if not obj:
             obj = self.object_name
@@ -1465,7 +1510,15 @@ class S3Request(swob.Request):
         if version is not None:
             query['version-id'] = version
         resp = self.get_response(app, 'HEAD', obj=obj, query=query)
-        return {'multipart-manifest': 'delete'} if resp.is_slo else {}
+        if not resp.is_slo:
+            return {}
+        elif resp.sysmeta_headers.get(sysmeta_header('object', 'etag')):
+            # Even if allow_async_delete is turned off, SLO will just handle
+            # the delete synchronously, so we don't need to check before
+            # setting async=on
+            return {'multipart-manifest': 'delete', 'async': 'on'}
+        else:
+            return {'multipart-manifest': 'delete'}
 
     def set_acl_handler(self, handler):
         pass
@@ -1475,14 +1528,8 @@ class S3AclRequest(S3Request):
     """
     S3Acl request object.
     """
-    def __init__(self, env, app, slo_enabled=True, storage_domain='',
-                 location='us-east-1', force_request_log=False,
-                 dns_compliant_bucket_names=True, allow_multipart_uploads=True,
-                 allow_no_owner=False):
-        super(S3AclRequest, self).__init__(
-            env, app, slo_enabled, storage_domain, location, force_request_log,
-            dns_compliant_bucket_names, allow_multipart_uploads)
-        self.allow_no_owner = allow_no_owner
+    def __init__(self, env, app=None, conf=None):
+        super(S3AclRequest, self).__init__(env, app, conf)
         self.authenticate(app)
         self.acl_handler = None
 
@@ -1524,6 +1571,8 @@ class S3AclRequest(S3Request):
 
         sw_req.environ.get('swift.authorize', lambda req: None)(sw_req)
         self.environ['swift_owner'] = sw_req.environ.get('swift_owner', False)
+        if 'REMOTE_USER' in sw_req.environ:
+            self.environ['REMOTE_USER'] = sw_req.environ['REMOTE_USER']
 
         # Need to skip S3 authorization on subsequent requests to prevent
         # overwriting the account in PATH_INFO
@@ -1549,9 +1598,9 @@ class S3AclRequest(S3Request):
         resp = self._get_response(
             app, method, container, obj, headers, body, query)
         resp.bucket_acl = decode_acl(
-            'container', resp.sysmeta_headers, self.allow_no_owner)
+            'container', resp.sysmeta_headers, self.conf.allow_no_owner)
         resp.object_acl = decode_acl(
-            'object', resp.sysmeta_headers, self.allow_no_owner)
+            'object', resp.sysmeta_headers, self.conf.allow_no_owner)
 
         return resp
 

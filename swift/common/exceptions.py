@@ -113,7 +113,11 @@ class DeviceUnavailable(SwiftException):
     pass
 
 
-class InvalidAccountInfo(SwiftException):
+class DatabaseAuditorException(SwiftException):
+    pass
+
+
+class InvalidAccountInfo(DatabaseAuditorException):
     pass
 
 
@@ -215,6 +219,10 @@ class ReplicationLockTimeout(LockTimeout):
     pass
 
 
+class PartitionLockTimeout(LockTimeout):
+    pass
+
+
 class MimeInvalid(SwiftException):
     pass
 
@@ -228,6 +236,10 @@ class EncryptionException(SwiftException):
 
 
 class UnknownSecretIdError(EncryptionException):
+    pass
+
+
+class QuarantineRequest(SwiftException):
     pass
 
 

@@ -13,20 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from eventlet import sleep
 import six
 from six.moves import urllib
 
 from swift.common import bufferedhttp
 from swift.common import exceptions
 from swift.common import http
+from swift.common import utils
 
 
-def encode_missing(object_hash, ts_data, ts_meta=None, ts_ctype=None):
+def encode_missing(object_hash, ts_data, ts_meta=None, ts_ctype=None,
+                   **kwargs):
     """
-    Returns a string representing the object hash, its data file timestamp
-    and the delta forwards to its metafile and content-type timestamps, if
-    non-zero, in the form:
-    ``<hash> <ts_data> [m:<hex delta to ts_meta>[,t:<hex delta to ts_ctype>]]``
+    Returns a string representing the object hash, its data file timestamp,
+    the delta forwards to its metafile and content-type timestamps, if
+    non-zero, and its durability, in the form:
+    ``<hash> <ts_data> [m:<hex delta to ts_meta>[,t:<hex delta to ts_ctype>]
+    [,durable:False]``
 
     The decoder for this line is
     :py:func:`~swift.obj.ssync_receiver.decode_missing`
@@ -34,12 +38,18 @@ def encode_missing(object_hash, ts_data, ts_meta=None, ts_ctype=None):
     msg = ('%s %s'
            % (urllib.parse.quote(object_hash),
               urllib.parse.quote(ts_data.internal)))
+    extra_parts = []
     if ts_meta and ts_meta != ts_data:
         delta = ts_meta.raw - ts_data.raw
-        msg = '%s m:%x' % (msg, delta)
+        extra_parts.append('m:%x' % delta)
         if ts_ctype and ts_ctype != ts_data:
             delta = ts_ctype.raw - ts_data.raw
-            msg = '%s,t:%x' % (msg, delta)
+            extra_parts.append('t:%x' % delta)
+    if 'durable' in kwargs and kwargs['durable'] is False:
+        # only send durable in the less common case that it is False
+        extra_parts.append('durable:%s' % kwargs['durable'])
+    if extra_parts:
+        msg = '%s %s' % (msg, ','.join(extra_parts))
     return msg.encode('ascii')
 
 
@@ -133,7 +143,8 @@ class Sender(object):
     process is there.
     """
 
-    def __init__(self, daemon, node, job, suffixes, remote_check_objs=None):
+    def __init__(self, daemon, node, job, suffixes, remote_check_objs=None,
+                 include_non_durable=False, max_objects=0):
         self.daemon = daemon
         self.df_mgr = self.daemon._df_router[job['policy']]
         self.node = node
@@ -142,6 +153,9 @@ class Sender(object):
         # When remote_check_objs is given in job, ssync_sender trys only to
         # make sure those objects exist or not in remote.
         self.remote_check_objs = remote_check_objs
+        self.include_non_durable = include_non_durable
+        self.max_objects = max_objects
+        self.limited_by_max_objects = False
 
     def __call__(self):
         """
@@ -185,23 +199,27 @@ class Sender(object):
                                       set(send_map.keys()))
                     can_delete_obj = dict((hash_, available_map[hash_])
                                           for hash_ in in_sync_hashes)
+                self.daemon.logger.debug(
+                    'ssync completed ok: dev: %s, part: %s, policy: %d, '
+                    'num suffixes: %s, available: %d, sent: %d, deletable: %d',
+                    self.job['device'], self.job['partition'],
+                    self.job['policy'].idx, len(self.suffixes),
+                    len(available_map), len(send_map), len(can_delete_obj))
                 return True, can_delete_obj
             except (exceptions.MessageTimeout,
                     exceptions.ReplicationException) as err:
-                self.daemon.logger.error(
-                    '%s:%s/%s/%s %s', self.node.get('replication_ip'),
-                    self.node.get('replication_port'), self.node.get('device'),
-                    self.job.get('partition'), err)
+                node_str = utils.node_to_string(self.node, replication=True)
+                self.daemon.logger.error('%s/%s %s', node_str,
+                                         self.job['partition'], err)
             except Exception:
                 # We don't want any exceptions to escape our code and possibly
                 # mess up the original replicator code that called us since it
                 # was originally written to shell out to rsync which would do
                 # no such thing.
+                node_str = utils.node_to_string(self.node, replication=True)
                 self.daemon.logger.exception(
-                    '%s:%s/%s/%s EXCEPTION in ssync.Sender',
-                    self.node.get('replication_ip'),
-                    self.node.get('replication_port'),
-                    self.node.get('device'), self.job.get('partition'))
+                    '%s/%s EXCEPTION in ssync.Sender',
+                    node_str, self.job['partition'])
             finally:
                 self.disconnect(connection)
         except Exception:
@@ -221,11 +239,11 @@ class Sender(object):
         with the object server.
         """
         connection = response = None
+        node_addr = '%s:%s' % (self.node['replication_ip'],
+                               self.node['replication_port'])
         with exceptions.MessageTimeout(
                 self.daemon.conn_timeout, 'connect send'):
-            connection = SsyncBufferedHTTPConnection(
-                '%s:%s' % (self.node['replication_ip'],
-                           self.node['replication_port']))
+            connection = SsyncBufferedHTTPConnection(node_addr)
             connection.putrequest('SSYNC', '/%s/%s' % (
                 self.node['device'], self.job['partition']))
             connection.putheader('Transfer-Encoding', 'chunked')
@@ -248,6 +266,14 @@ class Sender(object):
                 raise exceptions.ReplicationException(
                     'Expected status %s; got %s (%s)' %
                     (http.HTTP_OK, response.status, err_msg))
+            if self.include_non_durable and not utils.config_true_value(
+                    response.getheader('x-backend-accept-no-commit', False)):
+                # fall back to legacy behaviour if receiver does not understand
+                # X-Backend-Commit
+                self.daemon.logger.warning(
+                    'ssync receiver %s does not accept non-durable fragments' %
+                    node_addr)
+                self.include_non_durable = False
         return connection, response
 
     def missing_check(self, connection, response):
@@ -258,6 +284,7 @@ class Sender(object):
         Full documentation of this can be found at
         :py:meth:`.Receiver.missing_check`.
         """
+        self.limited_by_max_objects = False
         available_map = {}
         send_map = {}
         # First, send our list.
@@ -265,22 +292,47 @@ class Sender(object):
                 self.daemon.node_timeout, 'missing_check start'):
             msg = b':MISSING_CHECK: START\r\n'
             connection.send(b'%x\r\n%s\r\n' % (len(msg), msg))
+        # an empty frag_prefs list is sufficient to get non-durable frags
+        # yielded, in which case an older durable frag will not be yielded
+        frag_prefs = [] if self.include_non_durable else None
         hash_gen = self.df_mgr.yield_hashes(
             self.job['device'], self.job['partition'],
             self.job['policy'], self.suffixes,
-            frag_index=self.job.get('frag_index'))
+            frag_index=self.job.get('frag_index'),
+            frag_prefs=frag_prefs)
         if self.remote_check_objs is not None:
             hash_gen = six.moves.filter(
                 lambda objhash_timestamps:
                 objhash_timestamps[0] in
                 self.remote_check_objs, hash_gen)
+        nlines = 0
+        nbytes = 0
+        object_hash = None
         for object_hash, timestamps in hash_gen:
             available_map[object_hash] = timestamps
             with exceptions.MessageTimeout(
                     self.daemon.node_timeout,
-                    'missing_check send line'):
+                    'missing_check send line: %d lines (%d bytes) sent'
+                    % (nlines, nbytes)):
                 msg = b'%s\r\n' % encode_missing(object_hash, **timestamps)
-                connection.send(b'%x\r\n%s\r\n' % (len(msg), msg))
+                msg = b'%x\r\n%s\r\n' % (len(msg), msg)
+                connection.send(msg)
+            if nlines % 5 == 0:
+                sleep()  # Gives a chance for other greenthreads to run
+            nlines += 1
+            nbytes += len(msg)
+            if 0 < self.max_objects <= nlines:
+                break
+        for _ in hash_gen:
+            # only log truncation if there were more hashes to come...
+            self.limited_by_max_objects = True
+            self.daemon.logger.info(
+                'ssync missing_check truncated after %d objects: '
+                'device: %s, part: %s, policy: %s, last object hash: '
+                '%s', nlines, self.job['device'],
+                self.job['partition'], int(self.job['policy']),
+                object_hash)
+            break
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'missing_check end'):
             msg = b':MISSING_CHECK: END\r\n'
@@ -330,13 +382,15 @@ class Sender(object):
                 self.daemon.node_timeout, 'updates start'):
             msg = b':UPDATES: START\r\n'
             connection.send(b'%x\r\n%s\r\n' % (len(msg), msg))
+        frag_prefs = [] if self.include_non_durable else None
+        updates = 0
         for object_hash, want in send_map.items():
             object_hash = urllib.parse.unquote(object_hash)
             try:
                 df = self.df_mgr.get_diskfile_from_hash(
                     self.job['device'], self.job['partition'], object_hash,
                     self.job['policy'], frag_index=self.job.get('frag_index'),
-                    open_expired=True)
+                    open_expired=True, frag_prefs=frag_prefs)
             except exceptions.DiskFileNotExist:
                 continue
             url_path = urllib.parse.quote(
@@ -344,13 +398,15 @@ class Sender(object):
             try:
                 df.open()
                 if want.get('data'):
+                    is_durable = (df.durable_timestamp == df.data_timestamp)
                     # EC reconstructor may have passed a callback to build an
                     # alternative diskfile - construct it using the metadata
                     # from the data file only.
                     df_alt = self.job.get(
                         'sync_diskfile_builder', lambda *args: df)(
-                            self.job, self.node, df.get_datafile_metadata())
-                    self.send_put(connection, url_path, df_alt)
+                            self.job, self.node, df)
+                    self.send_put(connection, url_path, df_alt,
+                                  durable=is_durable)
                 if want.get('meta') and df.data_timestamp != df.timestamp:
                     self.send_post(connection, url_path, df)
             except exceptions.DiskFileDeleted as err:
@@ -363,6 +419,9 @@ class Sender(object):
                 # continue. The diskfile may however be deleted after a
                 # successful ssync since it remains in the send_map.
                 pass
+            if updates % 5 == 0:
+                sleep()  # Gives a chance for other greenthreads to run
+            updates += 1
         with exceptions.MessageTimeout(
                 self.daemon.node_timeout, 'updates end'):
             msg = b':UPDATES: END\r\n'
@@ -443,12 +502,16 @@ class Sender(object):
         headers = {'X-Timestamp': timestamp.internal}
         self.send_subrequest(connection, 'DELETE', url_path, headers, None)
 
-    def send_put(self, connection, url_path, df):
+    def send_put(self, connection, url_path, df, durable=True):
         """
         Sends a PUT subrequest for the url_path using the source df
         (DiskFile) and content_length.
         """
         headers = {'Content-Length': str(df.content_length)}
+        if not durable:
+            # only send this header for the less common case; without this
+            # header object servers assume default commit behaviour
+            headers['X-Backend-No-Commit'] = 'True'
         for key, value in df.get_datafile_metadata().items():
             if key not in ('name', 'Content-Length'):
                 headers[key] = value

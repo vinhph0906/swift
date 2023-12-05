@@ -15,6 +15,7 @@
 
 import base64
 import calendar
+import datetime
 import email.utils
 import re
 import six
@@ -108,9 +109,19 @@ def validate_bucket_name(name, dns_compliant_bucket_names):
 
 
 class S3Timestamp(utils.Timestamp):
+    S3_XML_FORMAT = "%Y-%m-%dT%H:%M:%S.000Z"
+
     @property
     def s3xmlformat(self):
-        return self.isoformat[:-7] + '.000Z'
+        dt = datetime.datetime.utcfromtimestamp(self.ceil())
+        return dt.strftime(self.S3_XML_FORMAT)
+
+    @classmethod
+    def from_s3xmlformat(cls, date_string):
+        dt = datetime.datetime.strptime(date_string, cls.S3_XML_FORMAT)
+        dt = dt.replace(tzinfo=utils.UTC)
+        seconds = calendar.timegm(dt.timetuple())
+        return cls(seconds)
 
     @property
     def amz_date_format(self):
@@ -119,10 +130,6 @@ class S3Timestamp(utils.Timestamp):
         """
         return self.isoformat.replace(
             '-', '').replace(':', '')[:-7] + 'Z'
-
-    @classmethod
-    def now(cls):
-        return cls(time.time())
 
 
 def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
@@ -156,7 +163,19 @@ def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
 
 
 class Config(dict):
+    DEFAULTS = {
+        'storage_domains': [],
+        'location': 'us-east-1',
+        'force_swift_request_proxy_log': False,
+        'dns_compliant_bucket_names': True,
+        'allow_multipart_uploads': True,
+        'allow_no_owner': False,
+        'allowable_clock_skew': 900,
+        'ratelimit_as_client_error': False,
+    }
+
     def __init__(self, base=None):
+        self.update(self.DEFAULTS)
         if base is not None:
             self.update(base)
 

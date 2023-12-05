@@ -324,14 +324,14 @@ In order to prevent rsync replication to specific drives, firstly
 setup ``rsync_module`` per disk in your ``object-replicator``.
 Set this in ``object-server.conf``:
 
-.. code::
+.. code:: cfg
 
     [object-replicator]
     rsync_module = {replication_ip}::object_{device}
 
 Set the individual drives in ``rsync.conf``. For example:
 
-.. code::
+.. code:: cfg
 
     [object_sda]
     max connections = 4
@@ -387,7 +387,7 @@ monitoring solution to achieve this. The following is an example script:
 For the above script to work, ensure ``/etc/rsync.d/`` conf files are
 included, by specifying ``&include`` in your ``rsync.conf`` file:
 
-.. code::
+.. code:: cfg
 
     &include /etc/rsync.d
 
@@ -395,7 +395,7 @@ Use this in conjunction with a cron job to periodically run the script, for exam
 
 .. highlight:: none
 
-.. code::
+.. code:: cfg
 
     # /etc/cron.d/devicecheck
     * * * * * root /some/path/to/disable_rsync.py
@@ -717,7 +717,7 @@ Once the recon middleware is enabled, a GET request for
 "/recon/<metric>" to the backend object server will return a
 JSON-formatted response::
 
-    fhines@ubuntu:~$ curl -i http://localhost:6030/recon/async
+    fhines@ubuntu:~$ curl -i http://localhost:6230/recon/async
     HTTP/1.1 200 OK
     Content-Type: application/json
     Content-Length: 20
@@ -727,7 +727,7 @@ JSON-formatted response::
 
 
 Note that the default port for the object server is 6200, except on a
-Swift All-In-One installation, which uses 6010, 6020, 6030, and 6040.
+Swift All-In-One installation, which uses 6210, 6220, 6230, and 6240.
 
 The following metrics and telemetry are currently exposed:
 
@@ -764,7 +764,7 @@ This information can also be queried via the swift-recon command line utility::
     fhines@ubuntu:~$ swift-recon -h
     Usage:
             usage: swift-recon <server_type> [-v] [--suppress] [-a] [-r] [-u] [-d]
-            [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
+            [-R] [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
 
             <server_type>   account|container|object
             Defaults to object server.
@@ -778,6 +778,7 @@ This information can also be queried via the swift-recon command line utility::
       --suppress            Suppress most connection related errors
       -a, --async           Get async stats
       -r, --replication     Get replication stats
+      -R, --reconstruction  Get reconstruction stats
       --auditor             Get auditor stats
       --updater             Get updater stats
       --expirer             Get expirer stats

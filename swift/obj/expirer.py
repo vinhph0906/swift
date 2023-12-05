@@ -18,9 +18,7 @@ import six
 from random import random
 from time import time
 from os.path import join
-from swift import gettext_ as _
 from collections import defaultdict, deque
-import hashlib
 
 from eventlet import sleep, Timeout
 from eventlet.greenpool import GreenPool
@@ -29,10 +27,11 @@ from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.daemon import Daemon
 from swift.common.internal_client import InternalClient, UnexpectedResponse
 from swift.common.utils import get_logger, dump_recon_cache, split_path, \
-    Timestamp, config_true_value, normalize_delete_at_timestamp
+    Timestamp, config_true_value, normalize_delete_at_timestamp, \
+    RateLimitedIterator, md5
 from swift.common.http import HTTP_NOT_FOUND, HTTP_CONFLICT, \
     HTTP_PRECONDITION_FAILED
-from swift.common.swob import wsgi_quote, str_to_wsgi
+from swift.common.recon import RECON_OBJECT_FILE, DEFAULT_RECON_CACHE_PATH
 
 from swift.container.reconciler import direct_delete_container_entry
 
@@ -41,14 +40,14 @@ ASYNC_DELETE_TYPE = 'application/async-deleted'
 
 
 def build_task_obj(timestamp, target_account, target_container,
-                   target_obj):
+                   target_obj, high_precision=False):
     """
     :return: a task object name in format of
              "<timestamp>-<target_account>/<target_container>/<target_obj>"
     """
     timestamp = Timestamp(timestamp)
     return '%s-%s/%s/%s' % (
-        normalize_delete_at_timestamp(timestamp),
+        normalize_delete_at_timestamp(timestamp, high_precision),
         target_account, target_container, target_obj)
 
 
@@ -74,11 +73,13 @@ class ObjectExpirer(Daemon):
 
     :param conf: The daemon configuration.
     """
+    log_route = 'object-expirer'
 
     def __init__(self, conf, logger=None, swift=None):
         self.conf = conf
-        self.logger = logger or get_logger(conf, log_route='object-expirer')
-        self.interval = int(conf.get('interval') or 300)
+        self.logger = logger or get_logger(conf, log_route=self.log_route)
+        self.interval = float(conf.get('interval') or 300)
+        self.tasks_per_second = float(conf.get('tasks_per_second', 50.0))
 
         self.conf_path = \
             self.conf.get('__file__') or '/etc/swift/object-expirer.conf'
@@ -98,12 +99,12 @@ class ObjectExpirer(Daemon):
 
         self.read_conf_for_queue_access(swift)
 
-        self.report_interval = int(conf.get('report_interval') or 300)
+        self.report_interval = float(conf.get('report_interval') or 300)
         self.report_first_time = self.report_last_time = time()
         self.report_objects = 0
         self.recon_cache_path = conf.get('recon_cache_path',
-                                         '/var/cache/swift')
-        self.rcache = join(self.recon_cache_path, 'object.recon')
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.rcache = join(self.recon_cache_path, RECON_OBJECT_FILE)
         self.concurrency = int(conf.get('concurrency', 1))
         if self.concurrency < 1:
             raise ValueError("concurrency must be set to at least 1")
@@ -134,7 +135,10 @@ class ObjectExpirer(Daemon):
 
         request_tries = int(self.conf.get('request_tries') or 3)
         self.swift = swift or InternalClient(
-            self.ic_conf_path, 'Swift Object Expirer', request_tries)
+            self.ic_conf_path, 'Swift Object Expirer', request_tries,
+            use_replication_network=True,
+            global_conf={'log_name': '%s-ic' % self.conf.get(
+                'log_name', self.log_route)})
 
         self.processes = int(self.conf.get('processes', 0))
         self.process = int(self.conf.get('process', 0))
@@ -149,17 +153,17 @@ class ObjectExpirer(Daemon):
         """
         if final:
             elapsed = time() - self.report_first_time
-            self.logger.info(_('Pass completed in %(time)ds; '
-                               '%(objects)d objects expired') % {
-                             'time': elapsed, 'objects': self.report_objects})
+            self.logger.info(
+                'Pass completed in %(time)ds; %(objects)d objects expired', {
+                    'time': elapsed, 'objects': self.report_objects})
             dump_recon_cache({'object_expiration_pass': elapsed,
                               'expired_last_pass': self.report_objects},
                              self.rcache, self.logger)
         elif time() - self.report_last_time >= self.report_interval:
             elapsed = time() - self.report_first_time
-            self.logger.info(_('Pass so far %(time)ds; '
-                               '%(objects)d objects expired') % {
-                             'time': elapsed, 'objects': self.report_objects})
+            self.logger.info(
+                'Pass so far %(time)ds; %(objects)d objects expired', {
+                    'time': elapsed, 'objects': self.report_objects})
             self.report_last_time = time()
 
     def parse_task_obj(self, task_obj):
@@ -215,7 +219,8 @@ class ObjectExpirer(Daemon):
         if not isinstance(name, bytes):
             name = name.encode('utf8')
         # md5 is only used for shuffling mod
-        return int(hashlib.md5(name).hexdigest(), 16) % divisor
+        return int(md5(
+            name, usedforsecurity=False).hexdigest(), 16) % divisor
 
     def iter_task_accounts_to_expire(self):
         """
@@ -260,7 +265,9 @@ class ObjectExpirer(Daemon):
         task_container, task_object, timestamp_to_delete, and target_path
         """
         for task_account, task_container in task_account_container_list:
+            container_empty = True
             for o in self.swift.iter_objects(task_account, task_container):
+                container_empty = False
                 if six.PY2:
                     task_object = o['name'].encode('utf8')
                 else:
@@ -290,6 +297,17 @@ class ObjectExpirer(Daemon):
                            target_account, target_container, target_object]),
                        'delete_timestamp': delete_timestamp,
                        'is_async_delete': is_async}
+            if container_empty:
+                try:
+                    self.swift.delete_container(
+                        task_account, task_container,
+                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
+                except (Exception, Timeout) as err:
+                    self.logger.exception(
+                        'Exception while deleting container %(account)s '
+                        '%(container)s %(err)s', {
+                            'account': task_account,
+                            'container': task_container, 'err': str(err)})
 
     def run_once(self, *args, **kwargs):
         """
@@ -318,7 +336,6 @@ class ObjectExpirer(Daemon):
         self.report_objects = 0
         try:
             self.logger.debug('Run begin')
-            task_account_container_list_to_delete = list()
             for task_account, my_index, divisor in \
                     self.iter_task_accounts_to_expire():
                 container_count, obj_count = \
@@ -328,20 +345,17 @@ class ObjectExpirer(Daemon):
                 if not container_count:
                     continue
 
-                self.logger.info(_(
+                self.logger.info(
                     'Pass beginning for task account %(account)s; '
                     '%(container_count)s possible containers; '
-                    '%(obj_count)s possible objects') % {
-                    'account': task_account,
-                    'container_count': container_count,
-                    'obj_count': obj_count})
+                    '%(obj_count)s possible objects', {
+                        'account': task_account,
+                        'container_count': container_count,
+                        'obj_count': obj_count})
 
                 task_account_container_list = \
                     [(task_account, task_container) for task_container in
                      self.iter_task_containers_to_expire(task_account)]
-
-                task_account_container_list_to_delete.extend(
-                    task_account_container_list)
 
                 # delete_task_iter is a generator to yield a dict of
                 # task_account, task_container, task_object, delete_timestamp,
@@ -350,27 +364,17 @@ class ObjectExpirer(Daemon):
                 delete_task_iter = \
                     self.round_robin_order(self.iter_task_to_expire(
                         task_account_container_list, my_index, divisor))
-
-                for delete_task in delete_task_iter:
+                rate_limited_iter = RateLimitedIterator(
+                    delete_task_iter,
+                    elements_per_second=self.tasks_per_second)
+                for delete_task in rate_limited_iter:
                     pool.spawn_n(self.delete_object, **delete_task)
 
             pool.waitall()
-            for task_account, task_container in \
-                    task_account_container_list_to_delete:
-                try:
-                    self.swift.delete_container(
-                        task_account, task_container,
-                        acceptable_statuses=(2, HTTP_NOT_FOUND, HTTP_CONFLICT))
-                except (Exception, Timeout) as err:
-                    self.logger.exception(
-                        _('Exception while deleting container %(account)s '
-                          '%(container)s %(err)s') % {
-                              'account': task_account,
-                              'container': task_container, 'err': str(err)})
             self.logger.debug('Run end')
             self.report(final=True)
         except (Exception, Timeout):
-            self.logger.exception(_('Unhandled exception'))
+            self.logger.exception('Unhandled exception')
 
     def run_forever(self, *args, **kwargs):
         """
@@ -387,7 +391,7 @@ class ObjectExpirer(Daemon):
             try:
                 self.run_once(*args, **kwargs)
             except (Exception, Timeout):
-                self.logger.exception(_('Unhandled exception'))
+                self.logger.exception('Unhandled exception')
             elapsed = time() - begin
             if elapsed < self.interval:
                 sleep(random() * (self.interval - elapsed))
@@ -481,7 +485,6 @@ class ObjectExpirer(Daemon):
         :raises UnexpectedResponse: if the delete was unsuccessful and
                                     should be retried later
         """
-        path = '/v1/' + wsgi_quote(str_to_wsgi(actual_obj.lstrip('/')))
         if is_async_delete:
             headers = {'X-Timestamp': timestamp.normal}
             acceptable_statuses = (2, HTTP_CONFLICT, HTTP_NOT_FOUND)
@@ -490,4 +493,6 @@ class ObjectExpirer(Daemon):
                        'X-If-Delete-At': timestamp.normal,
                        'X-Backend-Clean-Expiring-Object-Queue': 'no'}
             acceptable_statuses = (2, HTTP_CONFLICT)
-        self.swift.make_request('DELETE', path, headers, acceptable_statuses)
+        self.swift.delete_object(*split_path('/' + actual_obj, 3, 3, True),
+                                 headers=headers,
+                                 acceptable_statuses=acceptable_statuses)

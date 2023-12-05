@@ -44,7 +44,8 @@ from swift.common.middleware import RewriteContext
 from swift.common.swob import Request, HTTPBadRequest, \
     str_to_wsgi, wsgi_to_str
 from swift.common.utils import cache_from_env, get_logger, is_valid_ip, \
-    list_from_csv, parse_socket_string, register_swift_info
+    list_from_csv, parse_socket_string
+from swift.common.registry import register_swift_info
 
 
 def lookup_cname(domain, resolver):  # pragma: no cover
@@ -59,7 +60,7 @@ def lookup_cname(domain, resolver):  # pragma: no cover
     try:
         answer = resolver.query(domain, 'CNAME').rrset
         ttl = answer.ttl
-        result = answer.items[0].to_text()
+        result = list(answer.items)[0].to_text()
         result = result.rstrip('.')
         return ttl, result
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):

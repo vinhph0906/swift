@@ -17,7 +17,8 @@ from swift import gettext_ as _
 
 import eventlet
 
-from swift.common.utils import cache_from_env, get_logger, register_swift_info
+from swift.common.utils import cache_from_env, get_logger
+from swift.common.registry import register_swift_info
 from swift.proxy.controllers.base import get_account_info, get_container_info
 from swift.common.constraints import valid_api_version
 from swift.common.memcached import MemcacheConnectionError
@@ -282,11 +283,14 @@ class RateLimitMiddleware(object):
                 if need_to_sleep > 0:
                     eventlet.sleep(need_to_sleep)
             except MaxSleepTimeHitError as e:
+                if obj_name:
+                    path = '/'.join((account_name, container_name, obj_name))
+                else:
+                    path = '/'.join((account_name, container_name))
                 self.logger.error(
-                    _('Returning 498 for %(meth)s to %(acc)s/%(cont)s/%(obj)s '
-                      '. Ratelimit (Max Sleep) %(e)s'),
-                    {'meth': req.method, 'acc': account_name,
-                     'cont': container_name, 'obj': obj_name, 'e': str(e)})
+                    _('Returning 498 for %(meth)s to %(path)s. '
+                      'Ratelimit (Max Sleep) %(e)s'),
+                    {'meth': req.method, 'path': path, 'e': str(e)})
                 error_resp = Response(status='498 Rate Limited',
                                       body='Slow down', request=req)
                 return error_resp

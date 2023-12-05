@@ -476,6 +476,7 @@ def _make_display_device_table(builder):
     rep_ip_width = 14
     rep_port_width = 4
     ip_ipv6 = rep_ipv6 = False
+    weight_width = 6
     for dev in builder._iter_devs():
         if is_valid_ipv6(dev['ip']):
             ip_ipv6 = True
@@ -486,6 +487,8 @@ def _make_display_device_table(builder):
         port_width = max(len(str(dev['port'])), port_width)
         rep_port_width = max(len(str(dev['replication_port'])),
                              rep_port_width)
+        weight_width = max(len('%6.02f' % dev['weight']),
+                           weight_width)
     if ip_ipv6:
         ip_width += 2
     if rep_ipv6:
@@ -493,7 +496,7 @@ def _make_display_device_table(builder):
     header_line = ('Devices:%5s %6s %4s %' + str(ip_width)
                    + 's:%-' + str(port_width) + 's %' +
                    str(rep_ip_width) + 's:%-' + str(rep_port_width) +
-                   's %5s %6s %10s %7s %5s %s') % (
+                   's %5s %' + str(weight_width) + 's %10s %7s %5s %s') % (
                        'id', 'region', 'zone', 'ip address',
                        'port', 'replication ip', 'port', 'name',
                        'weight', 'partitions', 'balance', 'flags',
@@ -511,7 +514,8 @@ def _make_display_device_table(builder):
                                  '%', str(ip_width), 's:%-',
                                  str(port_width), 'd ', '%',
                                  str(rep_ip_width), 's', ':%-',
-                                 str(rep_port_width), 'd %5s %6.02f'
+                                 str(rep_port_width), 'd %5s %',
+                                 str(weight_width), '.02f'
                                  ' %10s %7.02f %5s %s'])
         args = (dev['id'], dev['region'], dev['zone'], dev_ip, dev['port'],
                 dev_replication_ip, dev['replication_port'], dev['device'],
@@ -540,7 +544,11 @@ swift-ring-builder <builder_file> create <part_power> <replicas>
         if len(argv) < 6:
             print(Commands.create.__doc__.strip())
             exit(EXIT_ERROR)
-        builder = RingBuilder(int(argv[3]), float(argv[4]), int(argv[5]))
+        try:
+            builder = RingBuilder(int(argv[3]), float(argv[4]), int(argv[5]))
+        except ValueError as e:
+            print(e)
+            exit(EXIT_ERROR)
         backup_dir = pathjoin(dirname(builder_file), 'backups')
         try:
             mkdir(backup_dir)
@@ -777,7 +785,7 @@ swift-ring-builder <builder_file> add
         if builder.next_part_power:
             print('Partition power increase in progress. You need ')
             print('to finish the increase first before adding devices.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         try:
             for new_dev in _parse_add_values(argv[3:]):
@@ -996,7 +1004,7 @@ swift-ring-builder <builder_file> remove
         if builder.next_part_power:
             print('Partition power increase in progress. You need ')
             print('to finish the increase first before removing devices.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         devs, opts = _parse_remove_values(argv[3:])
 
@@ -1063,7 +1071,7 @@ swift-ring-builder <builder_file> rebalance [options]
         if builder.next_part_power:
             print('Partition power increase in progress.')
             print('You need to finish the increase first before rebalancing.')
-            exit(EXIT_WARNING)
+            exit(EXIT_ERROR)
 
         devs_changed = builder.devs_changed
         min_part_seconds_left = builder.min_part_seconds_left

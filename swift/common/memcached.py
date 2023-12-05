@@ -44,19 +44,21 @@ version is at:
 http://github.com/memcached/memcached/blob/1.4.2/doc/protocol.txt
 """
 
+import os
 import six
-import six.moves.cPickle as pickle
 import json
 import logging
 import time
 from bisect import bisect
-from hashlib import md5
 
-from eventlet.green import socket
+from eventlet.green import socket, ssl
 from eventlet.pools import Pool
 from eventlet import Timeout
 from six.moves import range
+from six.moves.configparser import ConfigParser, NoSectionError, NoOptionError
 from swift.common import utils
+from swift.common.utils import md5, human_readable, config_true_value, \
+    memcached_timing_stats
 
 DEFAULT_MEMCACHED_PORT = 11211
 
@@ -66,14 +68,18 @@ IO_TIMEOUT = 2.0
 PICKLE_FLAG = 1
 JSON_FLAG = 2
 NODE_WEIGHT = 50
-PICKLE_PROTOCOL = 2
 TRY_COUNT = 3
 
 # if ERROR_LIMIT_COUNT errors occur in ERROR_LIMIT_TIME seconds, the server
 # will be considered failed for ERROR_LIMIT_DURATION seconds.
 ERROR_LIMIT_COUNT = 10
-ERROR_LIMIT_TIME = 60
-ERROR_LIMIT_DURATION = 60
+ERROR_LIMIT_TIME = ERROR_LIMIT_DURATION = 60
+DEFAULT_ITEM_SIZE_WARNING_THRESHOLD = -1
+
+# Different sample rates for emitting Memcached timing stats.
+TIMING_SAMPLE_RATE_HIGH = 0.1
+TIMING_SAMPLE_RATE_MEDIUM = 0.01
+TIMING_SAMPLE_RATE_LOW = 0.001
 
 
 def md5hash(key):
@@ -82,7 +88,7 @@ def md5hash(key):
             key = key.encode('utf-8')
         else:
             key = key.encode('utf-8', errors='surrogateescape')
-    return md5(key).hexdigest().encode('ascii')
+    return md5(key, usedforsecurity=False).hexdigest().encode('ascii')
 
 
 def sanitize_timeout(timeout):
@@ -128,11 +134,12 @@ class MemcacheConnPool(Pool):
     :func:`swift.common.utils.parse_socket_string` for details.
     """
 
-    def __init__(self, server, size, connect_timeout):
+    def __init__(self, server, size, connect_timeout, tls_context=None):
         Pool.__init__(self, max_size=size)
         self.host, self.port = utils.parse_socket_string(
             server, DEFAULT_MEMCACHED_PORT)
         self._connect_timeout = connect_timeout
+        self._tls_context = tls_context
 
     def create(self):
         addrs = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC,
@@ -140,16 +147,31 @@ class MemcacheConnPool(Pool):
         family, socktype, proto, canonname, sockaddr = addrs[0]
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        with Timeout(self._connect_timeout):
-            sock.connect(sockaddr)
+        try:
+            with Timeout(self._connect_timeout):
+                sock.connect(sockaddr)
+            if self._tls_context:
+                sock = self._tls_context.wrap_socket(sock,
+                                                     server_hostname=self.host)
+        except (Exception, Timeout):
+            sock.close()
+            raise
         return (sock.makefile('rwb'), sock)
 
     def get(self):
         fp, sock = super(MemcacheConnPool, self).get()
-        if fp is None:
-            # An error happened previously, so we need a new connection
-            fp, sock = self.create()
-        return fp, sock
+        try:
+            if fp is None:
+                # An error happened previously, so we need a new connection
+                fp, sock = self.create()
+            return fp, sock
+        except MemcachePoolTimeout:
+            # This is the only place that knows an item was successfully taken
+            # from the pool, so it has to be responsible for repopulating it.
+            # Any other errors should get handled in _get_conns(); see the
+            # comment about timeouts during create() there.
+            self.put((None, None))
+            raise
 
 
 class MemcacheRing(object):
@@ -157,31 +179,42 @@ class MemcacheRing(object):
     Simple, consistent-hashed memcache client.
     """
 
-    def __init__(self, servers, connect_timeout=CONN_TIMEOUT,
-                 io_timeout=IO_TIMEOUT, pool_timeout=POOL_TIMEOUT,
-                 tries=TRY_COUNT, allow_pickle=False, allow_unpickle=False,
-                 max_conns=2, logger=None):
+    def __init__(
+            self, servers, connect_timeout=CONN_TIMEOUT,
+            io_timeout=IO_TIMEOUT, pool_timeout=POOL_TIMEOUT,
+            tries=TRY_COUNT,
+            max_conns=2, tls_context=None, logger=None,
+            error_limit_count=ERROR_LIMIT_COUNT,
+            error_limit_time=ERROR_LIMIT_TIME,
+            error_limit_duration=ERROR_LIMIT_DURATION,
+            item_size_warning_threshold=DEFAULT_ITEM_SIZE_WARNING_THRESHOLD):
         self._ring = {}
         self._errors = dict(((serv, []) for serv in servers))
         self._error_limited = dict(((serv, 0) for serv in servers))
+        self._error_limit_count = error_limit_count
+        self._error_limit_time = error_limit_time
+        self._error_limit_duration = error_limit_duration
         for server in sorted(servers):
             for i in range(NODE_WEIGHT):
                 self._ring[md5hash('%s-%s' % (server, i))] = server
         self._tries = tries if tries <= len(servers) else len(servers)
         self._sorted = sorted(self._ring)
-        self._client_cache = dict(((server,
-                                    MemcacheConnPool(server, max_conns,
-                                                     connect_timeout))
-                                  for server in servers))
+        self._client_cache = dict((
+            (server, MemcacheConnPool(server, max_conns, connect_timeout,
+                                      tls_context=tls_context))
+            for server in servers))
         self._connect_timeout = connect_timeout
         self._io_timeout = io_timeout
         self._pool_timeout = pool_timeout
-        self._allow_pickle = allow_pickle
-        self._allow_unpickle = allow_unpickle or allow_pickle
         if logger is None:
             self.logger = logging.getLogger()
         else:
             self.logger = logger
+        self.item_size_warning_threshold = item_size_warning_threshold
+
+    @property
+    def memcache_servers(self):
+        return list(self._client_cache.keys())
 
     def _exception_occurred(self, server, e, action='talking',
                             sock=None, fp=None, got_connection=True):
@@ -211,22 +244,29 @@ class MemcacheRing(object):
             # We need to return something to the pool
             # A new connection will be created the next time it is retrieved
             self._return_conn(server, None, None)
+
+        if self._error_limit_time <= 0 or self._error_limit_duration <= 0:
+            return
+
         now = time.time()
-        self._errors[server].append(time.time())
-        if len(self._errors[server]) > ERROR_LIMIT_COUNT:
+        self._errors[server].append(now)
+        if len(self._errors[server]) > self._error_limit_count:
             self._errors[server] = [err for err in self._errors[server]
-                                    if err > now - ERROR_LIMIT_TIME]
-            if len(self._errors[server]) > ERROR_LIMIT_COUNT:
-                self._error_limited[server] = now + ERROR_LIMIT_DURATION
+                                    if err > now - self._error_limit_time]
+            if len(self._errors[server]) > self._error_limit_count:
+                self._error_limited[server] = now + self._error_limit_duration
                 self.logger.error('Error limiting server %s', server)
 
     def _get_conns(self, key):
         """
         Retrieves a server conn from the pool, or connects a new one.
         Chooses the server based on a consistent hash of "key".
+
+        :return: generator to serve memcached connection
         """
         pos = bisect(self._sorted, key)
         served = []
+        any_yielded = False
         while len(served) < self._tries:
             pos = (pos + 1) % len(self._sorted)
             server = self._ring[self._sorted[pos]]
@@ -239,6 +279,7 @@ class MemcacheRing(object):
             try:
                 with MemcachePoolTimeout(self._pool_timeout):
                     fp, sock = self._client_cache[server].get()
+                any_yielded = True
                 yield server, fp, sock
             except MemcachePoolTimeout as e:
                 self._exception_occurred(
@@ -250,34 +291,37 @@ class MemcacheRing(object):
                 # object.
                 self._exception_occurred(
                     server, e, action='connecting', sock=sock)
+        if not any_yielded:
+            self.logger.error('All memcached servers error-limited')
 
     def _return_conn(self, server, fp, sock):
         """Returns a server connection to the pool."""
         self._client_cache[server].put((fp, sock))
 
+    # Sample rates of different memcached operations are based on generic
+    # swift usage patterns.
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def set(self, key, value, serialize=True, time=0,
-            min_compress_len=0):
+            min_compress_len=0, raise_on_error=False):
         """
         Set a key/value pair in memcache
 
         :param key: key
         :param value: value
         :param serialize: if True, value is serialized with JSON before sending
-                          to memcache, or with pickle if configured to use
-                          pickle instead of JSON (to avoid cache poisoning)
+                          to memcache
         :param time: the time to live
         :param min_compress_len: minimum compress length, this parameter was
                                  added to keep the signature compatible with
                                  python-memcached interface. This
                                  implementation ignores it.
+        :param raise_on_error: if True, propagate Timeouts and other errors.
+                               By default, errors are ignored.
         """
         key = md5hash(key)
         timeout = sanitize_timeout(time)
         flags = 0
-        if serialize and self._allow_pickle:
-            value = pickle.dumps(value, PICKLE_PROTOCOL)
-            flags |= PICKLE_FLAG
-        elif serialize:
+        if serialize:
             if isinstance(value, bytes):
                 value = value.decode('utf8')
             value = json.dumps(value).encode('ascii')
@@ -290,19 +334,38 @@ class MemcacheRing(object):
                 with Timeout(self._io_timeout):
                     sock.sendall(set_msg(key, flags, timeout, value))
                     # Wait for the set to complete
-                    fp.readline()
+                    msg = fp.readline().strip()
+                    if msg != b'STORED':
+                        if not six.PY2:
+                            msg = msg.decode('ascii')
+                        self.logger.error(
+                            "Error setting value in memcached: "
+                            "%(server)s: %(msg)s",
+                            {'server': server, 'msg': msg})
+                    if 0 <= self.item_size_warning_threshold <= len(value):
+                        self.logger.warning(
+                            "Item size larger than warning threshold: "
+                            "%d (%s) >= %d (%s)", len(value),
+                            human_readable(len(value)),
+                            self.item_size_warning_threshold,
+                            human_readable(self.item_size_warning_threshold))
                     self._return_conn(server, fp, sock)
                     return
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
+        if raise_on_error:
+            raise MemcacheConnectionError(
+                "No memcached connections succeeded.")
 
-    def get(self, key):
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_MEDIUM)
+    def get(self, key, raise_on_error=False):
         """
         Gets the object specified by key.  It will also unserialize the object
-        before returning if it is serialized in memcache with JSON, or if it
-        is pickled and unpickling is allowed.
+        before returning if it is serialized in memcache with JSON.
 
         :param key: key
+        :param raise_on_error: if True, propagate Timeouts and other errors.
+                               By default, errors are treated as cache misses.
         :returns: value of the key in memcache
         """
         key = md5hash(key)
@@ -321,11 +384,8 @@ class MemcacheRing(object):
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
-                            elif int(line[2]) & JSON_FLAG:
+                                value = None
+                            if int(line[2]) & JSON_FLAG:
                                 value = json.loads(value)
                             fp.readline()
                         line = fp.readline().strip().split()
@@ -333,7 +393,11 @@ class MemcacheRing(object):
                     return value
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
+        if raise_on_error:
+            raise MemcacheConnectionError(
+                "No memcached connections succeeded.")
 
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_LOW)
     def incr(self, key, delta=1, time=0):
         """
         Increments a key which has a numeric value by delta.
@@ -389,6 +453,7 @@ class MemcacheRing(object):
                 self._exception_occurred(server, e, sock=sock, fp=fp)
         raise MemcacheConnectionError("No Memcached connections succeeded.")
 
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_LOW)
     def decr(self, key, delta=1, time=0):
         """
         Decrements a key which has a numeric value by delta. Calls incr with
@@ -404,6 +469,7 @@ class MemcacheRing(object):
         """
         return self.incr(key, delta=-delta, time=time)
 
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def delete(self, key, server_key=None):
         """
         Deletes a key/value pair from memcache.
@@ -425,6 +491,7 @@ class MemcacheRing(object):
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
 
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def set_multi(self, mapping, server_key, serialize=True, time=0,
                   min_compress_len=0):
         """
@@ -434,8 +501,7 @@ class MemcacheRing(object):
         :param server_key: key to use in determining which server in the ring
                             is used
         :param serialize: if True, value is serialized with JSON before sending
-                          to memcache, or with pickle if configured to use
-                          pickle instead of JSON (to avoid cache poisoning)
+                          to memcache.
         :param time: the time to live
         :min_compress_len: minimum compress length, this parameter was added
                            to keep the signature compatible with
@@ -448,10 +514,7 @@ class MemcacheRing(object):
         for key, value in mapping.items():
             key = md5hash(key)
             flags = 0
-            if serialize and self._allow_pickle:
-                value = pickle.dumps(value, PICKLE_PROTOCOL)
-                flags |= PICKLE_FLAG
-            elif serialize:
+            if serialize:
                 if isinstance(value, bytes):
                     value = value.decode('utf8')
                 value = json.dumps(value).encode('ascii')
@@ -469,6 +532,7 @@ class MemcacheRing(object):
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
 
+    @memcached_timing_stats(sample_rate=TIMING_SAMPLE_RATE_HIGH)
     def get_multi(self, keys, server_key):
         """
         Gets multiple values from memcache for the given keys.
@@ -495,10 +559,7 @@ class MemcacheRing(object):
                             size = int(line[3])
                             value = fp.read(size)
                             if int(line[2]) & PICKLE_FLAG:
-                                if self._allow_unpickle:
-                                    value = pickle.loads(value)
-                                else:
-                                    value = None
+                                value = None
                             elif int(line[2]) & JSON_FLAG:
                                 value = json.loads(value)
                             responses[line[1]] = value
@@ -514,3 +575,96 @@ class MemcacheRing(object):
                     return values
             except (Exception, Timeout) as e:
                 self._exception_occurred(server, e, sock=sock, fp=fp)
+
+
+def load_memcache(conf, logger):
+    """
+    Build a MemcacheRing object from the given config.  It will also use the
+    passed in logger.
+
+    :param conf: a dict, the config options
+    :param logger: a logger
+    """
+    memcache_servers = conf.get('memcache_servers')
+    try:
+        # Originally, while we documented using memcache_max_connections
+        # we only accepted max_connections
+        max_conns = int(conf.get('memcache_max_connections',
+                                 conf.get('max_connections', 0)))
+    except ValueError:
+        max_conns = 0
+
+    memcache_options = {}
+    if (not memcache_servers
+            or max_conns <= 0):
+        path = os.path.join(conf.get('swift_dir', '/etc/swift'),
+                            'memcache.conf')
+        memcache_conf = ConfigParser()
+        if memcache_conf.read(path):
+            # if memcache.conf exists we'll start with those base options
+            try:
+                memcache_options = dict(memcache_conf.items('memcache'))
+            except NoSectionError:
+                pass
+
+            if not memcache_servers:
+                try:
+                    memcache_servers = \
+                        memcache_conf.get('memcache', 'memcache_servers')
+                except (NoSectionError, NoOptionError):
+                    pass
+            if max_conns <= 0:
+                try:
+                    new_max_conns = \
+                        memcache_conf.get('memcache',
+                                          'memcache_max_connections')
+                    max_conns = int(new_max_conns)
+                except (NoSectionError, NoOptionError, ValueError):
+                    pass
+
+    # while memcache.conf options are the base for the memcache
+    # middleware, if you set the same option also in the filter
+    # section of the proxy config it is more specific.
+    memcache_options.update(conf)
+    connect_timeout = float(memcache_options.get(
+        'connect_timeout', CONN_TIMEOUT))
+    pool_timeout = float(memcache_options.get(
+        'pool_timeout', POOL_TIMEOUT))
+    tries = int(memcache_options.get('tries', TRY_COUNT))
+    io_timeout = float(memcache_options.get('io_timeout', IO_TIMEOUT))
+    if config_true_value(memcache_options.get('tls_enabled', 'false')):
+        tls_cafile = memcache_options.get('tls_cafile')
+        tls_certfile = memcache_options.get('tls_certfile')
+        tls_keyfile = memcache_options.get('tls_keyfile')
+        tls_context = ssl.create_default_context(
+            cafile=tls_cafile)
+        if tls_certfile:
+            tls_context.load_cert_chain(tls_certfile, tls_keyfile)
+    else:
+        tls_context = None
+    error_suppression_interval = float(memcache_options.get(
+        'error_suppression_interval', ERROR_LIMIT_TIME))
+    error_suppression_limit = float(memcache_options.get(
+        'error_suppression_limit', ERROR_LIMIT_COUNT))
+    item_size_warning_threshold = int(memcache_options.get(
+        'item_size_warning_threshold', DEFAULT_ITEM_SIZE_WARNING_THRESHOLD))
+
+    if not memcache_servers:
+        memcache_servers = '127.0.0.1:11211'
+    if max_conns <= 0:
+        max_conns = 2
+
+    return MemcacheRing(
+        [s.strip() for s in memcache_servers.split(',')
+         if s.strip()],
+        connect_timeout=connect_timeout,
+        pool_timeout=pool_timeout,
+        tries=tries,
+        io_timeout=io_timeout,
+        max_conns=max_conns,
+        tls_context=tls_context,
+        logger=logger,
+        error_limit_count=error_suppression_limit,
+        error_limit_time=error_suppression_interval,
+        error_limit_duration=error_suppression_interval,
+        item_size_warning_threshold=item_size_warning_threshold)

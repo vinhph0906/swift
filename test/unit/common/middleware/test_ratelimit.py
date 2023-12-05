@@ -17,58 +17,16 @@ import unittest
 import time
 import eventlet
 import mock
-from contextlib import contextmanager
 
-from test.unit import FakeLogger
+from test.debug_logger import debug_logger
+from test.unit import FakeMemcache
 from swift.common.middleware import ratelimit
 from swift.proxy.controllers.base import get_cache_key, \
     headers_to_container_info
-from swift.common.memcached import MemcacheConnectionError
 from swift.common.swob import Request
-from swift.common import utils
+from swift.common import registry
 
 threading = eventlet.patcher.original('threading')
-
-
-class FakeMemcache(object):
-
-    def __init__(self):
-        self.store = {}
-        self.error_on_incr = False
-        self.init_incr_return_neg = False
-
-    def get(self, key):
-        return self.store.get(key)
-
-    def set(self, key, value, serialize=False, time=0):
-        self.store[key] = value
-        return True
-
-    def incr(self, key, delta=1, time=0):
-        if self.error_on_incr:
-            raise MemcacheConnectionError('Memcache restarting')
-        if self.init_incr_return_neg:
-            # simulate initial hit, force reset of memcache
-            self.init_incr_return_neg = False
-            return -10000000
-        self.store[key] = int(self.store.setdefault(key, 0)) + int(delta)
-        if self.store[key] < 0:
-            self.store[key] = 0
-        return int(self.store[key])
-
-    def decr(self, key, delta=1, time=0):
-        return self.incr(key, delta=-delta, time=time)
-
-    @contextmanager
-    def soft_lock(self, key, timeout=0, retries=5):
-        yield True
-
-    def delete(self, key):
-        try:
-            del self.store[key]
-        except Exception:
-            pass
-        return True
 
 
 class FakeApp(object):
@@ -147,7 +105,7 @@ class TestRateLimit(unittest.TestCase):
                      'container_ratelimit_50': 100,
                      'container_ratelimit_75': 30}
         test_ratelimit = ratelimit.filter_factory(conf_dict)(FakeApp())
-        test_ratelimit.logger = FakeLogger()
+        test_ratelimit.logger = debug_logger()
         self.assertIsNone(ratelimit.get_maxrate(
             test_ratelimit.container_ratelimits, 0))
         self.assertIsNone(ratelimit.get_maxrate(
@@ -319,7 +277,7 @@ class TestRateLimit(unittest.TestCase):
                      'account_whitelist': 'a',
                      'account_blacklist': 'b'}
         self.test_ratelimit = ratelimit.filter_factory(conf_dict)(FakeApp())
-        self.test_ratelimit.logger = FakeLogger()
+        self.test_ratelimit.logger = debug_logger()
         self.test_ratelimit.BLACK_LIST_SLEEP = 0
         req = Request.blank('/v1/b/c')
         req.environ['swift.cache'] = FakeMemcache()
@@ -588,8 +546,8 @@ class TestRateLimit(unittest.TestCase):
 
 class TestSwiftInfo(unittest.TestCase):
     def setUp(self):
-        utils._swift_info = {}
-        utils._swift_admin_info = {}
+        registry._swift_info = {}
+        registry._swift_admin_info = {}
 
     def test_registered_defaults(self):
 
@@ -610,7 +568,7 @@ class TestSwiftInfo(unittest.TestCase):
                        'container_listing_ratelimit_50': 50}
 
         ratelimit.filter_factory(test_limits)('have to pass in an app')
-        swift_info = utils.get_swift_info()
+        swift_info = registry.get_swift_info()
         self.assertIn('ratelimit', swift_info)
         self.assertEqual(swift_info['ratelimit']
                          ['account_ratelimit'], 1.0)

@@ -61,28 +61,28 @@ Static Large Object when the multipart upload is completed.
 
 import binascii
 import copy
-from hashlib import md5
 import os
 import re
 import time
 
 import six
 
-from swift.common.swob import Range, bytes_to_wsgi, normalize_etag
-from swift.common.utils import json, public, reiterate
+from swift.common import constraints
+from swift.common.swob import Range, bytes_to_wsgi, normalize_etag, wsgi_to_str
+from swift.common.utils import json, public, reiterate, md5
 from swift.common.db import utf8encode
-from swift.common.request_helpers import get_container_update_override_key
+from swift.common.request_helpers import get_container_update_override_key, \
+    get_param
 
 from six.moves.urllib.parse import quote, urlparse
 
 from swift.common.middleware.s3api.controllers.base import Controller, \
     bucket_operation, object_operation, check_container_existence
 from swift.common.middleware.s3api.s3response import InvalidArgument, \
-    ErrorResponse, MalformedXML, BadDigest, \
+    ErrorResponse, MalformedXML, BadDigest, KeyTooLongError, \
     InvalidPart, BucketAlreadyExists, EntityTooSmall, InvalidPartOrder, \
     InvalidRequest, HTTPOk, HTTPNoContent, NoSuchKey, NoSuchUpload, \
     NoSuchBucket, BucketAlreadyOwnedByYou
-from swift.common.middleware.s3api.exception import BadSwiftRequest
 from swift.common.middleware.s3api.utils import unique_id, \
     MULTIUPLOAD_SUFFIX, S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, \
@@ -108,6 +108,19 @@ def _get_upload_info(req, app, upload_id):
     try:
         return req.get_response(app, 'HEAD', container=container, obj=obj)
     except NoSuchKey:
+        upload_marker_path = req.environ.get('s3api.backend_path')
+        try:
+            resp = req.get_response(app, 'HEAD')
+            if resp.sysmeta_headers.get(sysmeta_header(
+                    'object', 'upload-id')) == upload_id:
+                return resp
+        except NoSuchKey:
+            pass
+        finally:
+            # Ops often find it more useful for us to log the upload marker
+            # path, so put it back
+            if upload_marker_path is not None:
+                req.environ['s3api.backend_path'] = upload_marker_path
         raise NoSuchUpload(upload_id=upload_id)
     finally:
         # ...making sure to restore any copy-source before returning
@@ -115,9 +128,34 @@ def _get_upload_info(req, app, upload_id):
             req.headers['X-Amz-Copy-Source'] = copy_source
 
 
-def _check_upload_info(req, app, upload_id):
+def _make_complete_body(req, s3_etag, yielded_anything):
+    result_elem = Element('CompleteMultipartUploadResult')
 
-    _get_upload_info(req, app, upload_id)
+    # NOTE: boto with sig v4 appends port to HTTP_HOST value at
+    # the request header when the port is non default value and it
+    # makes req.host_url like as http://localhost:8080:8080/path
+    # that obviously invalid. Probably it should be resolved at
+    # swift.common.swob though, tentatively we are parsing and
+    # reconstructing the correct host_url info here.
+    # in detail, https://github.com/boto/boto/pull/3513
+    parsed_url = urlparse(req.host_url)
+    host_url = '%s://%s' % (parsed_url.scheme, parsed_url.hostname)
+    # Why are we doing our own port parsing? Because py3 decided
+    # to start raising ValueErrors on access after parsing such
+    # an invalid port
+    netloc = parsed_url.netloc.split('@')[-1].split(']')[-1]
+    if ':' in netloc:
+        port = netloc.split(':', 2)[1]
+        host_url += ':%s' % port
+
+    SubElement(result_elem, 'Location').text = host_url + req.path
+    SubElement(result_elem, 'Bucket').text = req.container_name
+    SubElement(result_elem, 'Key').text = wsgi_to_str(req.object_name)
+    SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
+    body = tostring(result_elem, xml_declaration=not yielded_anything)
+    if yielded_anything:
+        return b'\n' + body
+    return body
 
 
 class PartController(Controller):
@@ -142,17 +180,17 @@ class PartController(Controller):
                                   'Unexpected query string parameter')
 
         try:
-            part_number = int(req.params['partNumber'])
+            part_number = int(get_param(req, 'partNumber'))
             if part_number < 1 or self.conf.max_upload_part_num < part_number:
                 raise Exception()
         except Exception:
             err_msg = 'Part number must be an integer between 1 and %d,' \
                       ' inclusive' % self.conf.max_upload_part_num
-            raise InvalidArgument('partNumber', req.params['partNumber'],
+            raise InvalidArgument('partNumber', get_param(req, 'partNumber'),
                                   err_msg)
 
-        upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        upload_id = get_param(req, 'uploadId')
+        _get_upload_info(req, self.app, upload_id)
 
         req.container_name += MULTIUPLOAD_SUFFIX
         req.object_name = '%s/%s/%d' % (req.object_name, upload_id,
@@ -260,19 +298,19 @@ class UploadsController(Controller):
                     non_delimited_uploads.append(upload)
             return non_delimited_uploads, sorted(common_prefixes)
 
-        encoding_type = req.params.get('encoding-type')
+        encoding_type = get_param(req, 'encoding-type')
         if encoding_type is not None and encoding_type != 'url':
             err_msg = 'Invalid Encoding Method specified in Request'
             raise InvalidArgument('encoding-type', encoding_type, err_msg)
 
-        keymarker = req.params.get('key-marker', '')
-        uploadid = req.params.get('upload-id-marker', '')
+        keymarker = get_param(req, 'key-marker', '')
+        uploadid = get_param(req, 'upload-id-marker', '')
         maxuploads = req.get_validated_param(
             'max-uploads', DEFAULT_MAX_UPLOADS, DEFAULT_MAX_UPLOADS)
 
         query = {
             'format': 'json',
-            'limit': maxuploads + 1,
+            'marker': '',
         }
 
         if uploadid and keymarker:
@@ -280,15 +318,11 @@ class UploadsController(Controller):
         elif keymarker:
             query.update({'marker': '%s/~' % (keymarker)})
         if 'prefix' in req.params:
-            query.update({'prefix': req.params['prefix']})
+            query.update({'prefix': get_param(req, 'prefix')})
 
         container = req.container_name + MULTIUPLOAD_SUFFIX
-        try:
-            resp = req.get_response(self.app, container=container, query=query)
-            objects = json.loads(resp.body)
-        except NoSuchBucket:
-            # Assume NoSuchBucket as no uploads
-            objects = []
+        uploads = []
+        prefixes = []
 
         def object_to_upload(object_info):
             obj, upid = object_info['name'].rsplit('/', 1)
@@ -297,24 +331,37 @@ class UploadsController(Controller):
                         'last_modified': object_info['last_modified']}
             return obj_dict
 
-        # uploads is a list consists of dict, {key, upload_id, last_modified}
-        # Note that pattern matcher will drop whole segments objects like as
-        # object_name/upload_id/1.
-        pattern = re.compile('/[0-9]+$')
-        uploads = [object_to_upload(obj) for obj in objects if
-                   pattern.search(obj.get('name', '')) is None]
+        is_segment = re.compile('.*/[0-9]+$')
 
-        prefixes = []
-        if 'delimiter' in req.params:
-            prefix = req.params.get('prefix', '')
-            delimiter = req.params['delimiter']
-            uploads, prefixes = separate_uploads(uploads, prefix, delimiter)
+        while len(uploads) < maxuploads:
+            try:
+                resp = req.get_response(self.app, container=container,
+                                        query=query)
+                objects = json.loads(resp.body)
+            except NoSuchBucket:
+                # Assume NoSuchBucket as no uploads
+                objects = []
+            if not objects:
+                break
 
+            new_uploads = [object_to_upload(obj) for obj in objects
+                           if not is_segment.match(obj.get('name', ''))]
+            new_prefixes = []
+            if 'delimiter' in req.params:
+                prefix = get_param(req, 'prefix', '')
+                delimiter = get_param(req, 'delimiter')
+                new_uploads, new_prefixes = separate_uploads(
+                    new_uploads, prefix, delimiter)
+            uploads.extend(new_uploads)
+            prefixes.extend(new_prefixes)
+            if six.PY2:
+                query['marker'] = objects[-1]['name'].encode('utf-8')
+            else:
+                query['marker'] = objects[-1]['name']
+
+        truncated = len(uploads) >= maxuploads
         if len(uploads) > maxuploads:
             uploads = uploads[:maxuploads]
-            truncated = True
-        else:
-            truncated = False
 
         nextkeymarker = ''
         nextuploadmarker = ''
@@ -329,9 +376,10 @@ class UploadsController(Controller):
         SubElement(result_elem, 'NextKeyMarker').text = nextkeymarker
         SubElement(result_elem, 'NextUploadIdMarker').text = nextuploadmarker
         if 'delimiter' in req.params:
-            SubElement(result_elem, 'Delimiter').text = req.params['delimiter']
+            SubElement(result_elem, 'Delimiter').text = \
+                get_param(req, 'delimiter')
         if 'prefix' in req.params:
-            SubElement(result_elem, 'Prefix').text = req.params['prefix']
+            SubElement(result_elem, 'Prefix').text = get_param(req, 'prefix')
         SubElement(result_elem, 'MaxUploads').text = str(maxuploads)
         if encoding_type is not None:
             SubElement(result_elem, 'EncodingType').text = encoding_type
@@ -355,7 +403,7 @@ class UploadsController(Controller):
             SubElement(owner_elem, 'DisplayName').text = req.user_id
             SubElement(upload_elem, 'StorageClass').text = 'STANDARD'
             SubElement(upload_elem, 'Initiated').text = \
-                u['last_modified'][:-3] + 'Z'
+                S3Timestamp.from_isoformat(u['last_modified']).s3xmlformat
 
         for p in prefixes:
             elem = SubElement(result_elem, 'CommonPrefixes')
@@ -372,6 +420,11 @@ class UploadsController(Controller):
         """
         Handles Initiate Multipart Upload.
         """
+        if len(req.object_name) > constraints.MAX_OBJECT_NAME_LENGTH:
+            # Note that we can still run into trouble where the MPU is just
+            # within the limit, which means the segment names will go over
+            raise KeyTooLongError()
+
         # Create a unique S3 upload id from UUID to avoid duplicates.
         upload_id = unique_id()
 
@@ -393,10 +446,14 @@ class UploadsController(Controller):
         except NoSuchBucket:
             try:
                 # multi-upload bucket doesn't exist, create one with
-                # same storage policy as the primary bucket
+                # same storage policy and acls as the primary bucket
                 info = req.get_container_info(self.app)
                 policy_name = POLICIES[info['storage_policy']].name
                 hdrs = {'X-Storage-Policy': policy_name}
+                if info.get('read_acl'):
+                    hdrs['X-Container-Read'] = info['read_acl']
+                if info.get('write_acl'):
+                    hdrs['X-Container-Write'] = info['write_acl']
                 seg_req.get_response(self.app, 'PUT', seg_container, '',
                                      headers=hdrs)
             except (BucketAlreadyExists, BucketAlreadyOwnedByYou):
@@ -411,7 +468,7 @@ class UploadsController(Controller):
 
         result_elem = Element('InitiateMultipartUploadResult')
         SubElement(result_elem, 'Bucket').text = req.container_name
-        SubElement(result_elem, 'Key').text = req.object_name
+        SubElement(result_elem, 'Key').text = wsgi_to_str(req.object_name)
         SubElement(result_elem, 'UploadId').text = upload_id
 
         body = tostring(result_elem)
@@ -443,13 +500,13 @@ class UploadController(Controller):
             except ValueError:
                 return False
 
-        encoding_type = req.params.get('encoding-type')
+        encoding_type = get_param(req, 'encoding-type')
         if encoding_type is not None and encoding_type != 'url':
             err_msg = 'Invalid Encoding Method specified in Request'
             raise InvalidArgument('encoding-type', encoding_type, err_msg)
 
-        upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        upload_id = get_param(req, 'uploadId')
+        _get_upload_info(req, self.app, upload_id)
 
         maxparts = req.get_validated_param(
             'max-parts', DEFAULT_MAX_PARTS_LISTING,
@@ -457,17 +514,29 @@ class UploadController(Controller):
         part_num_marker = req.get_validated_param(
             'part-number-marker', 0)
 
+        object_name = wsgi_to_str(req.object_name)
         query = {
             'format': 'json',
-            'limit': maxparts + 1,
-            'prefix': '%s/%s/' % (req.object_name, upload_id),
-            'delimiter': '/'
+            'prefix': '%s/%s/' % (object_name, upload_id),
+            'delimiter': '/',
+            'marker': '',
         }
 
         container = req.container_name + MULTIUPLOAD_SUFFIX
-        resp = req.get_response(self.app, container=container, obj='',
-                                query=query)
-        objects = json.loads(resp.body)
+        # Because the parts are out of order in Swift, we list up to the
+        # maximum number of parts and then apply the marker and limit options.
+        objects = []
+        while True:
+            resp = req.get_response(self.app, container=container, obj='',
+                                    query=query)
+            new_objects = json.loads(resp.body)
+            if not new_objects:
+                break
+            objects.extend(new_objects)
+            if six.PY2:
+                query['marker'] = new_objects[-1]['name'].encode('utf-8')
+            else:
+                query['marker'] = new_objects[-1]['name']
 
         last_part = 0
 
@@ -493,10 +562,9 @@ class UploadController(Controller):
 
         result_elem = Element('ListPartsResult')
         SubElement(result_elem, 'Bucket').text = req.container_name
-        name = req.object_name
         if encoding_type == 'url':
-            name = quote(name)
-        SubElement(result_elem, 'Key').text = name
+            object_name = quote(object_name)
+        SubElement(result_elem, 'Key').text = object_name
         SubElement(result_elem, 'UploadId').text = upload_id
 
         initiator_elem = SubElement(result_elem, 'Initiator')
@@ -512,7 +580,7 @@ class UploadController(Controller):
         SubElement(result_elem, 'MaxParts').text = str(maxparts)
         if 'encoding-type' in req.params:
             SubElement(result_elem, 'EncodingType').text = \
-                req.params['encoding-type']
+                get_param(req, 'encoding-type')
         SubElement(result_elem, 'IsTruncated').text = \
             'true' if truncated else 'false'
 
@@ -520,7 +588,7 @@ class UploadController(Controller):
             part_elem = SubElement(result_elem, 'Part')
             SubElement(part_elem, 'PartNumber').text = i['name'].split('/')[-1]
             SubElement(part_elem, 'LastModified').text = \
-                i['last_modified'][:-3] + 'Z'
+                S3Timestamp.from_isoformat(i['last_modified']).s3xmlformat
             SubElement(part_elem, 'ETag').text = '"%s"' % i['hash']
             SubElement(part_elem, 'Size').text = str(i['bytes'])
 
@@ -535,8 +603,8 @@ class UploadController(Controller):
         """
         Handles Abort Multipart Upload.
         """
-        upload_id = req.params['uploadId']
-        _check_upload_info(req, self.app, upload_id)
+        upload_id = get_param(req, 'uploadId')
+        _get_upload_info(req, self.app, upload_id)
 
         # First check to see if this multi-part upload was already
         # completed.  Look in the primary container, if the object exists,
@@ -549,9 +617,10 @@ class UploadController(Controller):
         # must be a multipart upload abort.
         # We must delete any uploaded segments for this UploadID and then
         # delete the object in the main container as well
+        object_name = wsgi_to_str(req.object_name)
         query = {
             'format': 'json',
-            'prefix': '%s/%s/' % (req.object_name, upload_id),
+            'prefix': '%s/%s/' % (object_name, upload_id),
             'delimiter': '/',
         }
 
@@ -564,7 +633,10 @@ class UploadController(Controller):
                 container = req.container_name + MULTIUPLOAD_SUFFIX
                 obj = bytes_to_wsgi(o['name'].encode('utf-8'))
                 req.get_response(self.app, container=container, obj=obj)
-            query['marker'] = objects[-1]['name']
+            if six.PY2:
+                query['marker'] = objects[-1]['name'].encode('utf-8')
+            else:
+                query['marker'] = objects[-1]['name']
             resp = req.get_response(self.app, 'GET', container, '',
                                     query=query)
             objects = json.loads(resp.body)
@@ -578,13 +650,17 @@ class UploadController(Controller):
         """
         Handles Complete Multipart Upload.
         """
-        upload_id = req.params['uploadId']
+        upload_id = get_param(req, 'uploadId')
         resp = _get_upload_info(req, self.app, upload_id)
-        headers = {'Accept': 'application/json'}
+        headers = {'Accept': 'application/json',
+                   sysmeta_header('object', 'upload-id'): upload_id}
         for key, val in resp.headers.items():
             _key = key.lower()
             if _key.startswith('x-amz-meta-'):
                 headers['x-object-meta-' + _key[11:]] = val
+            elif _key in ('content-encoding', 'content-language',
+                          'content-disposition', 'expires', 'cache-control'):
+                headers[key] = val
 
         hct_header = sysmeta_header('object', 'has-content-type')
         if resp.sysmeta_headers.get(hct_header) == 'yes':
@@ -603,7 +679,7 @@ class UploadController(Controller):
             headers['Content-Type'] = content_type
 
         container = req.container_name + MULTIUPLOAD_SUFFIX
-        s3_etag_hasher = md5()
+        s3_etag_hasher = md5(usedforsecurity=False)
         manifest = []
         previous_number = 0
         try:
@@ -613,7 +689,8 @@ class UploadController(Controller):
             if 'content-md5' in req.headers:
                 # If an MD5 was provided, we need to verify it.
                 # Note that S3Request already took care of translating to ETag
-                if req.headers['etag'] != md5(xml).hexdigest():
+                if req.headers['etag'] != md5(
+                        xml, usedforsecurity=False).hexdigest():
                     raise BadDigest(content_md5=req.headers['content-md5'])
                 # We're only interested in the body here, in the
                 # multipart-upload controller -- *don't* let it get
@@ -630,14 +707,19 @@ class UploadController(Controller):
                 previous_number = part_number
 
                 etag = normalize_etag(part_elem.find('./ETag').text)
+                if etag is None:
+                    raise InvalidPart(upload_id=upload_id,
+                                      part_number=part_number,
+                                      e_tag=etag)
                 if len(etag) != 32 or any(c not in '0123456789abcdef'
                                           for c in etag):
                     raise InvalidPart(upload_id=upload_id,
-                                      part_number=part_number)
-
+                                      part_number=part_number,
+                                      e_tag=etag)
                 manifest.append({
                     'path': '/%s/%s/%s/%d' % (
-                        container, req.object_name, upload_id, part_number),
+                        wsgi_to_str(container), wsgi_to_str(req.object_name),
+                        upload_id, part_number),
                     'etag': etag})
                 s3_etag_hasher.update(binascii.a2b_hex(etag))
         except (XMLSyntaxError, DocumentInvalid):
@@ -650,7 +732,15 @@ class UploadController(Controller):
             raise
 
         s3_etag = '%s-%d' % (s3_etag_hasher.hexdigest(), len(manifest))
-        headers[sysmeta_header('object', 'etag')] = s3_etag
+        s3_etag_header = sysmeta_header('object', 'etag')
+        if resp.sysmeta_headers.get(s3_etag_header) == s3_etag:
+            # This header should only already be present if the upload marker
+            # has been cleaned up and the current target uses the same
+            # upload-id; assuming the segments to use haven't changed, the work
+            # is already done
+            return HTTPOk(body=_make_complete_body(req, s3_etag, False),
+                          content_type='application/xml')
+        headers[s3_etag_header] = s3_etag
         # Leave base header value blank; SLO will populate
         c_etag = '; s3_etag=%s' % s3_etag
         headers[get_container_update_override_key('etag')] = c_etag
@@ -714,8 +804,8 @@ class UploadController(Controller):
                                 status=body['Response Status'],
                                 msg='\n'.join(': '.join(err)
                                               for err in body['Errors']))
-                except BadSwiftRequest as e:
-                    msg = str(e)
+                except InvalidRequest as err_resp:
+                    msg = err_resp._msg
                     if too_small_message in msg:
                         raise EntityTooSmall(msg)
                     elif ', Etag Mismatch' in msg:
@@ -730,37 +820,13 @@ class UploadController(Controller):
                 try:
                     req.get_response(self.app, 'DELETE', container, obj)
                 except NoSuchKey:
-                    # We know that this existed long enough for us to HEAD
+                    # The important thing is that we wrote out a tombstone to
+                    # make sure the marker got cleaned up. If it's already
+                    # gone (e.g., because of concurrent completes or a retried
+                    # complete), so much the better.
                     pass
 
-                result_elem = Element('CompleteMultipartUploadResult')
-
-                # NOTE: boto with sig v4 appends port to HTTP_HOST value at
-                # the request header when the port is non default value and it
-                # makes req.host_url like as http://localhost:8080:8080/path
-                # that obviously invalid. Probably it should be resolved at
-                # swift.common.swob though, tentatively we are parsing and
-                # reconstructing the correct host_url info here.
-                # in detail, https://github.com/boto/boto/pull/3513
-                parsed_url = urlparse(req.host_url)
-                host_url = '%s://%s' % (parsed_url.scheme, parsed_url.hostname)
-                # Why are we doing our own port parsing? Because py3 decided
-                # to start raising ValueErrors on access after parsing such
-                # an invalid port
-                netloc = parsed_url.netloc.split('@')[-1].split(']')[-1]
-                if ':' in netloc:
-                    port = netloc.split(':', 2)[1]
-                    host_url += ':%s' % port
-
-                SubElement(result_elem, 'Location').text = host_url + req.path
-                SubElement(result_elem, 'Bucket').text = req.container_name
-                SubElement(result_elem, 'Key').text = req.object_name
-                SubElement(result_elem, 'ETag').text = '"%s"' % s3_etag
-                resp.headers.pop('ETag', None)
-                if yielded_anything:
-                    yield b'\n'
-                yield tostring(result_elem,
-                               xml_declaration=not yielded_anything)
+                yield _make_complete_body(req, s3_etag, yielded_anything)
             except ErrorResponse as err_resp:
                 if yielded_anything:
                     err_resp.xml_declaration = False

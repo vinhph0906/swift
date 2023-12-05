@@ -54,12 +54,13 @@ in a line like this::
 
     user64_<account_b64>_<user_b64> = <key> [group] [...] [storage_url]
 
-There are two special groups:
+There are three special groups:
 
 * ``.reseller_admin`` -- can do anything to any account for this auth
+* ``.reseller_reader`` -- can GET/HEAD anything in any account for this auth
 * ``.admin`` -- can do anything within the account
 
-If neither of these groups are specified, the user can only access
+If none of these groups are specified, the user can only access
 containers that have been explicitly allowed for them by a ``.admin`` or
 ``.reseller_admin``.
 
@@ -124,8 +125,8 @@ and ``X-Service-Token`` is from the ``glance`` user::
    user_maryacct_mary = marypw .admin
    user_glance_glance = glancepw .service
 
-The name ``.service`` is an example. Unlike ``.admin`` and
-``.reseller_admin`` it is not a reserved name.
+The name ``.service`` is an example. Unlike ``.admin``, ``.reseller_admin``,
+``.reseller_reader`` it is not a reserved name.
 
 Please note that ACLs can be set on service accounts and are matched
 against the identity validated by ``X-Auth-Token``. As such ACLs can grant
@@ -182,15 +183,17 @@ import base64
 
 from eventlet import Timeout
 import six
+from swift.common.memcached import MemcacheConnectionError
 from swift.common.swob import Response, Request, wsgi_to_str
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
-    HTTPUnauthorized, HTTPMethodNotAllowed
+    HTTPUnauthorized, HTTPMethodNotAllowed, HTTPServiceUnavailable
 
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.middleware.acl import (
     clean_acl, parse_acl, referrer_allowed, acls_from_account_info)
 from swift.common.utils import cache_from_env, get_logger, \
-    split_path, config_true_value, register_swift_info
+    split_path, config_true_value
+from swift.common.registry import register_swift_info
 from swift.common.utils import config_read_reseller_options, quote
 from swift.proxy.controllers.base import get_account_info
 
@@ -207,13 +210,14 @@ class TempAuth(object):
     def __init__(self, app, conf):
         self.app = app
         self.conf = conf
-        self.logger = get_logger(conf, log_route='tempauth')
-        self.log_headers = config_true_value(conf.get('log_headers', 'f'))
         self.reseller_prefixes, self.account_rules = \
             config_read_reseller_options(conf, dict(require_group=''))
         self.reseller_prefix = self.reseller_prefixes[0]
-        self.logger.set_statsd_prefix('tempauth.%s' % (
-            self.reseller_prefix if self.reseller_prefix else 'NONE',))
+        statsd_tail_prefix = 'tempauth.%s' % (
+            self.reseller_prefix if self.reseller_prefix else 'NONE',)
+        self.logger = get_logger(conf, log_route='tempauth',
+                                 statsd_tail_prefix=statsd_tail_prefix)
+        self.log_headers = config_true_value(conf.get('log_headers', 'f'))
         self.auth_prefix = conf.get('auth_prefix', '/auth/')
         if not self.auth_prefix or not self.auth_prefix.strip('/'):
             self.logger.warning('Rewriting invalid auth prefix "%s" to '
@@ -231,7 +235,11 @@ class TempAuth(object):
         self.users = {}
         for conf_key in conf:
             if conf_key.startswith(('user_', 'user64_')):
-                account, username = conf_key.split('_', 1)[1].split('_')
+                try:
+                    account, username = conf_key.split('_', 1)[1].split('_')
+                except ValueError:
+                    raise ValueError("key %s was provided in an "
+                                     "invalid format" % conf_key)
                 if conf_key.startswith('user64_'):
                     # Because trailing equal signs would screw up config file
                     # parsing, we auto-pad with '=' chars.
@@ -569,6 +577,14 @@ class TempAuth(object):
                               % account_user)
             return None
 
+        if '.reseller_reader' in user_groups and \
+                account not in self.reseller_prefixes and \
+                not self._dot_account(account) and \
+                req.method in ('GET', 'HEAD'):
+            self.logger.debug("User %s has reseller reader authorizing."
+                              % account_user)
+            return None
+
         if wsgi_to_str(account) in user_groups and \
                 (req.method not in ('DELETE', 'PUT') or container):
             # The user is admin for the account and is not trying to do an
@@ -666,8 +682,6 @@ class TempAuth(object):
             req = Request(env)
             if self.auth_prefix:
                 req.path_info_pop()
-            req.bytes_transferred = '-'
-            req.client_disconnect = False
             if 'x-storage-token' in req.headers and \
                     'x-auth-token' not in req.headers:
                 req.headers['x-auth-token'] = req.headers['x-storage-token']
@@ -677,7 +691,7 @@ class TempAuth(object):
             self.logger.increment('errors')
             start_response('500 Server Error',
                            [('Content-Type', 'text/plain')])
-            return ['Internal server error.\n']
+            return [b'Internal server error.\n']
 
     def handle_request(self, req):
         """
@@ -706,6 +720,25 @@ class TempAuth(object):
         else:
             req.response = handler(req)
         return req.response
+
+    def _create_new_token(self, memcache_client,
+                          account, account_user, account_id):
+        # Generate new token
+        token = '%stk%s' % (self.reseller_prefix, uuid4().hex)
+        expires = time() + self.token_life
+        groups = self._get_user_groups(account, account_user, account_id)
+        # Save token
+        memcache_token_key = '%s/token/%s' % (self.reseller_prefix, token)
+        memcache_client.set(memcache_token_key, (expires, groups),
+                            time=float(expires - time()),
+                            raise_on_error=True)
+        # Record the token with the user info for future use.
+        memcache_user_key = \
+            '%s/user/%s' % (self.reseller_prefix, account_user)
+        memcache_client.set(memcache_user_key, token,
+                            time=float(expires - time()),
+                            raise_on_error=True)
+        return token, expires
 
     def handle_get_token(self, req):
         """
@@ -814,19 +847,11 @@ class TempAuth(object):
                     token = candidate_token
         # Create a new token if one didn't exist
         if not token:
-            # Generate new token
-            token = '%stk%s' % (self.reseller_prefix, uuid4().hex)
-            expires = time() + self.token_life
-            groups = self._get_user_groups(account, account_user, account_id)
-            # Save token
-            memcache_token_key = '%s/token/%s' % (self.reseller_prefix, token)
-            memcache_client.set(memcache_token_key, (expires, groups),
-                                time=float(expires - time()))
-            # Record the token with the user info for future use.
-            memcache_user_key = \
-                '%s/user/%s' % (self.reseller_prefix, account_user)
-            memcache_client.set(memcache_user_key, token,
-                                time=float(expires - time()))
+            try:
+                token, expires = self._create_new_token(
+                    memcache_client, account, account_user, account_id)
+            except MemcacheConnectionError:
+                return HTTPServiceUnavailable(request=req)
         resp = Response(request=req, headers={
             'x-auth-token': token, 'x-storage-token': token,
             'x-auth-token-expires': str(int(expires - time()))})

@@ -60,7 +60,7 @@ def make_delete_jobs(account, container, objects, timestamp):
             'name': build_task_obj(
                 timestamp, account, container,
                 obj.decode('utf8') if six.PY2 and isinstance(obj, str)
-                else obj),
+                else obj, high_precision=True),
             'deleted': 0,
             'created_at': timestamp.internal,
             'etag': MD5_OF_EMPTY_STRING,
@@ -133,7 +133,7 @@ def mark_for_deletion(swift, account, container, marker, end_marker,
         return enqueue_deletes()
 
 
-def main():
+def main(args=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawTextHelpFormatter)
@@ -156,10 +156,11 @@ def main():
     parser.add_argument(
         '--timestamp', type=Timestamp, default=Timestamp.now(),
         help='delete all objects as of this time (default: now)')
-    args = parser.parse_args()
+    args = parser.parse_args(args)
 
     swift = InternalClient(
-        args.config, 'Swift Container Deleter', args.request_tries)
+        args.config, 'Swift Container Deleter', args.request_tries,
+        global_conf={'log_name': 'container-deleter-ic'})
     for deleted, marker in mark_for_deletion(
             swift, args.account, args.container,
             args.marker, args.end_marker, args.prefix, args.timestamp):

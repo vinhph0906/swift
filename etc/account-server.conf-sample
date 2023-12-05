@@ -80,7 +80,7 @@ bind_port = 6202
 # ionice_priority =
 
 [pipeline:main]
-pipeline = healthcheck recon account-server
+pipeline = healthcheck recon backend_ratelimit account-server
 
 [app:account-server]
 use = egg:swift#account
@@ -91,13 +91,13 @@ use = egg:swift#account
 # set log_requests = true
 # set log_address = /dev/log
 #
-# Configure parameter for creating specific server
-# To handle all verbs, including replication verbs, do not specify
-# "replication_server" (this is the default). To only handle replication,
-# set to a True value (e.g. "True" or "1"). To handle only non-replication
-# verbs, set to "False". Unless you have a separate replication network, you
-# should not specify any value for "replication_server". Default is empty.
-# replication_server = false
+# You can disable REPLICATE handling (default is to allow it). When deploying
+# a cluster with a separate replication network, you'll want multiple
+# account-server processes running: one for client-driven traffic and another
+# for replication traffic. The server handling client-driven traffic may set
+# this to false. If there is only one account-server process, leave this as
+# true.
+# replication_server = true
 #
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
@@ -128,6 +128,18 @@ use = egg:swift#healthcheck
 use = egg:swift#recon
 # recon_cache_path = /var/cache/swift
 
+[filter:backend_ratelimit]
+use = egg:swift#backend_ratelimit
+# Set the maximum rate of requests per second per device per worker. Beyond
+# this rate the server will return 529 responses and emit a 'backend.ratelimit'
+# statsd metric without logging. The default value of zero causes no
+# rate-limiting to be applied.
+# requests_per_device_per_second = 0.0
+#
+# Set the number of seconds of unused rate-limiting allowance that can
+# accumulate and be used to allow a subsequent burst of requests.
+# requests_per_device_rate_buffer = 1.0
+
 [account-replicator]
 # You can override the default log routing for this app here (don't use set!):
 # log_name = account-replicator
@@ -151,9 +163,9 @@ use = egg:swift#recon
 # concurrency = 8
 #
 # Time in seconds to wait between replication passes
-# interval = 30
+# interval = 30.0
 # run_pause is deprecated, use interval instead
-# run_pause = 30
+# run_pause = 30.0
 #
 # Process at most this many databases per second
 # databases_per_second = 50
@@ -187,8 +199,8 @@ use = egg:swift#recon
 # ionice_class =
 # ionice_priority =
 #
-# The handoffs_only mode option is for special-case emergency
-# situations such as full disks in the cluster. This option SHOULD NOT
+# The handoffs_only and handoff_delete options are for special-case emergency
+# situations such as full disks in the cluster. These options SHOULD NOT
 # BE ENABLED except in emergencies. When handoffs_only mode is enabled
 # the replicator will *only* replicate from handoff nodes to primary
 # nodes and will not sync primary nodes with other primary nodes.
@@ -205,6 +217,15 @@ use = egg:swift#recon
 # long-term use.
 #
 # handoffs_only = no
+#
+# handoff_delete is the number of replicas which are ensured in swift.
+# If the number less than the number of replicas is set, account-replicator
+# could delete local handoffs even if all replicas are not ensured in the
+# cluster. The replicator would remove local handoff account database after
+# syncing when the number of successful responses is greater than or equal to
+# this number. By default(auto), handoff partitions will be
+# removed  when it has successfully replicated to all the canonical nodes.
+# handoff_delete = auto
 
 [account-auditor]
 # You can override the default log routing for this app here (don't use set!):
@@ -214,7 +235,7 @@ use = egg:swift#recon
 # log_address = /dev/log
 #
 # Will audit each account at most once per interval
-# interval = 1800
+# interval = 1800.0
 #
 # accounts_per_second = 200
 # recon_cache_path = /var/cache/swift
@@ -239,7 +260,7 @@ use = egg:swift#recon
 # log_address = /dev/log
 #
 # concurrency = 25
-# interval = 3600
+# interval = 3600.0
 # node_timeout = 10
 # conn_timeout = 0.5
 #

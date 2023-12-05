@@ -201,7 +201,7 @@ class TestS3ApiBucket(S3ApiTestCase):
         items = []
         for o in objects:
             items.append((o.find('./Key').text, o.find('./ETag').text))
-            self.assertEqual('2011-01-05T02:19:14.275Z',
+            self.assertEqual('2011-01-05T02:19:15.000Z',
                              o.find('./LastModified').text)
         expected = [
             (i[0].encode('utf-8') if six.PY2 else i[0],
@@ -210,6 +210,37 @@ class TestS3ApiBucket(S3ApiTestCase):
             for i in self.objects
         ]
         self.assertEqual(items, expected)
+
+    def test_bucket_GET_last_modified_rounding(self):
+        objects_list = [
+            {'name': 'a', 'last_modified': '2011-01-05T02:19:59.275290',
+             'content_type': 'application/octet-stream',
+             'hash': 'ahash', 'bytes': '12345'},
+            {'name': 'b', 'last_modified': '2011-01-05T02:19:59.000000',
+             'content_type': 'application/octet-stream',
+             'hash': 'ahash', 'bytes': '12345'},
+        ]
+        self.swift.register(
+            'GET', '/v1/AUTH_test/junk',
+            swob.HTTPOk, {'Content-Type': 'application/json'},
+            json.dumps(objects_list))
+        req = Request.blank('/junk',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+
+        elem = fromstring(body, 'ListBucketResult')
+        name = elem.find('./Name').text
+        self.assertEqual(name, 'junk')
+        objects = elem.iterchildren('Contents')
+        actual = [(obj.find('./Key').text, obj.find('./LastModified').text)
+                  for obj in objects]
+        self.assertEqual(
+            [('a', '2011-01-05T02:20:00.000Z'),
+             ('b', '2011-01-05T02:19:59.000Z')],
+            actual)
 
     def test_bucket_GET_url_encoded(self):
         bucket_name = 'junk'
@@ -229,7 +260,7 @@ class TestS3ApiBucket(S3ApiTestCase):
         items = []
         for o in objects:
             items.append((o.find('./Key').text, o.find('./ETag').text))
-            self.assertEqual('2011-01-05T02:19:14.275Z',
+            self.assertEqual('2011-01-05T02:19:15.000Z',
                              o.find('./LastModified').text)
 
         self.assertEqual(items, [
@@ -467,15 +498,42 @@ class TestS3ApiBucket(S3ApiTestCase):
                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         elem = fromstring(body, 'ListBucketResult')
-        self.assertEqual(elem.find('./Prefix').text, '\xef\xbc\xa3')
-        self.assertEqual(elem.find('./Marker').text, '\xef\xbc\xa2')
-        self.assertEqual(elem.find('./Delimiter').text, '\xef\xbc\xa1')
+        self.assertEqual(elem.find('./Prefix').text,
+                         swob.wsgi_to_str('\xef\xbc\xa3'))
+        self.assertEqual(elem.find('./Marker').text,
+                         swob.wsgi_to_str('\xef\xbc\xa2'))
+        self.assertEqual(elem.find('./Delimiter').text,
+                         swob.wsgi_to_str('\xef\xbc\xa1'))
         _, path = self.swift.calls[-1]
         _, query_string = path.split('?')
-        args = dict(parse_qsl(query_string))
-        self.assertEqual(args['delimiter'], '\xef\xbc\xa1')
-        self.assertEqual(args['marker'], '\xef\xbc\xa2')
-        self.assertEqual(args['prefix'], '\xef\xbc\xa3')
+        args = [part.partition('=')[::2] for part in query_string.split('&')]
+        self.assertEqual(sorted(args), [
+            ('delimiter', '%EF%BC%A1'),
+            ('limit', '1001'),
+            ('marker', '%EF%BC%A2'),
+            ('prefix', '%EF%BC%A3'),
+        ])
+
+        req = Request.blank(
+            '/%s?delimiter=\xef\xbc\xa1&marker=\xef\xbc\xa2&'
+            'prefix=\xef\xbc\xa3&encoding-type=url' % bucket_name,
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        elem = fromstring(body, 'ListBucketResult')
+        self.assertEqual(elem.find('./Prefix').text, '%EF%BC%A3')
+        self.assertEqual(elem.find('./Marker').text, '%EF%BC%A2')
+        self.assertEqual(elem.find('./Delimiter').text, '%EF%BC%A1')
+        _, path = self.swift.calls[-1]
+        _, query_string = path.split('?')
+        args = [part.partition('=')[::2] for part in query_string.split('&')]
+        self.assertEqual(sorted(args), [
+            ('delimiter', '%EF%BC%A1'),
+            ('limit', '1001'),
+            ('marker', '%EF%BC%A2'),
+            ('prefix', '%EF%BC%A3'),
+        ])
 
     def test_bucket_GET_v2_with_nonascii_queries(self):
         bucket_name = 'junk'
@@ -487,15 +545,42 @@ class TestS3ApiBucket(S3ApiTestCase):
                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         elem = fromstring(body, 'ListBucketResult')
-        self.assertEqual(elem.find('./Prefix').text, '\xef\xbc\xa3')
-        self.assertEqual(elem.find('./StartAfter').text, '\xef\xbc\xa2')
-        self.assertEqual(elem.find('./Delimiter').text, '\xef\xbc\xa1')
+        self.assertEqual(elem.find('./Prefix').text,
+                         swob.wsgi_to_str('\xef\xbc\xa3'))
+        self.assertEqual(elem.find('./StartAfter').text,
+                         swob.wsgi_to_str('\xef\xbc\xa2'))
+        self.assertEqual(elem.find('./Delimiter').text,
+                         swob.wsgi_to_str('\xef\xbc\xa1'))
         _, path = self.swift.calls[-1]
         _, query_string = path.split('?')
-        args = dict(parse_qsl(query_string))
-        self.assertEqual(args['delimiter'], '\xef\xbc\xa1')
-        self.assertEqual(args['marker'], '\xef\xbc\xa2')
-        self.assertEqual(args['prefix'], '\xef\xbc\xa3')
+        args = [part.partition('=')[::2] for part in query_string.split('&')]
+        self.assertEqual(sorted(args), [
+            ('delimiter', '%EF%BC%A1'),
+            ('limit', '1001'),
+            ('marker', '%EF%BC%A2'),
+            ('prefix', '%EF%BC%A3'),
+        ])
+
+        req = Request.blank(
+            '/%s?list-type=2&delimiter=\xef\xbc\xa1&start-after=\xef\xbc\xa2&'
+            'prefix=\xef\xbc\xa3&encoding-type=url' % bucket_name,
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Authorization': 'AWS test:tester:hmac',
+                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        elem = fromstring(body, 'ListBucketResult')
+        self.assertEqual(elem.find('./Prefix').text, '%EF%BC%A3')
+        self.assertEqual(elem.find('./StartAfter').text, '%EF%BC%A2')
+        self.assertEqual(elem.find('./Delimiter').text, '%EF%BC%A1')
+        _, path = self.swift.calls[-1]
+        _, query_string = path.split('?')
+        args = [part.partition('=')[::2] for part in query_string.split('&')]
+        self.assertEqual(sorted(args), [
+            ('delimiter', '%EF%BC%A1'),
+            ('limit', '1001'),
+            ('marker', '%EF%BC%A2'),
+            ('prefix', '%EF%BC%A3'),
+        ])
 
     def test_bucket_GET_with_delimiter_max_keys(self):
         bucket_name = 'junk'
@@ -619,9 +704,9 @@ class TestS3ApiBucket(S3ApiTestCase):
         self.assertEqual([v.find('./VersionId').text for v in versions],
                          ['null' for v in objects])
         # Last modified in self.objects is 2011-01-05T02:19:14.275290 but
-        # the returned value is 2011-01-05T02:19:14.275Z
+        # the returned value is rounded up to 2011-01-05T02:19:15Z
         self.assertEqual([v.find('./LastModified').text for v in versions],
-                         [v[1][:-3] + 'Z' for v in objects])
+                         ['2011-01-05T02:19:15.000Z'] * len(objects))
         self.assertEqual([v.find('./ETag').text for v in versions],
                          [PFS_ETAG if v[0] == 'pfs-obj' else
                           '"0-N"' if v[0] == 'slo' else '"0"'
@@ -1220,6 +1305,29 @@ class TestS3ApiBucket(S3ApiTestCase):
         # Even crazier: it doesn't seem to matter
         self._test_bucket_PUT_with_location('foo')
 
+    def test_bucket_PUT_with_mixed_case_location(self):
+        self.s3api.conf.location = 'RegionOne'
+        elem = Element('CreateBucketConfiguration')
+        # We've observed some clients (like aws-sdk-net) shift regions
+        # to lower case
+        SubElement(elem, 'LocationConstraint').text = 'regionone'
+        headers = {
+            'Authorization': 'AWS4-HMAC-SHA256 ' + ', '.join([
+                'Credential=test:tester/%s/regionone/s3/aws4_request' %
+                self.get_v4_amz_date_header().split('T', 1)[0],
+                'SignedHeaders=host',
+                'Signature=X',
+            ]),
+            'Date': self.get_date_header(),
+            'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+        }
+        req = Request.blank('/bucket',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers=headers,
+                            body=tostring(elem))
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200', body)
+
     def test_bucket_PUT_with_canned_acl(self):
         req = Request.blank('/bucket',
                             environ={'REQUEST_METHOD': 'PUT'},
@@ -1292,10 +1400,50 @@ class TestS3ApiBucket(S3ApiTestCase):
         self.assertEqual(code, 'InternalError')
 
         # bucket not empty is now validated at s3api
+        self.swift._responses.get(('HEAD', '/v1/AUTH_test/bucket'))
         self.swift.register('HEAD', '/v1/AUTH_test/bucket', swob.HTTPNoContent,
                             {'X-Container-Object-Count': '1'}, None)
-        code = self._test_method_error('DELETE', '/bucket', swob.HTTPConflict)
-        self.assertEqual(code, 'BucketNotEmpty')
+        req = Request.blank('/bucket',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, _headers, body = self.call_s3api(req)
+        self.assertEqual('409 Conflict', status)
+        self.assertEqual('BucketNotEmpty', self._get_error_code(body))
+        self.assertNotIn('You must delete all versions in the bucket',
+                         self._get_error_message(body))
+
+    @s3acl
+    def test_bucket_DELETE_error_with_enabled_versioning(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket', swob.HTTPNoContent,
+                            {'X-Container-Object-Count': '1',
+                             'X-Container-Sysmeta-Versions-Enabled': 'True'},
+                            None)
+        req = Request.blank('/bucket',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, _headers, body = self.call_s3api(req)
+        self.assertEqual('409 Conflict', status)
+        self.assertEqual('BucketNotEmpty', self._get_error_code(body))
+        self.assertIn('You must delete all versions in the bucket',
+                      self._get_error_message(body))
+
+    @s3acl
+    def test_bucket_DELETE_error_with_suspended_versioning(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket', swob.HTTPNoContent,
+                            {'X-Container-Object-Count': '1',
+                             'X-Container-Sysmeta-Versions-Enabled': 'False'},
+                            None)
+        req = Request.blank('/bucket',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, _headers, body = self.call_s3api(req)
+        self.assertEqual('409 Conflict', status)
+        self.assertEqual('BucketNotEmpty', self._get_error_code(body))
+        self.assertIn('You must delete all versions in the bucket',
+                      self._get_error_message(body))
 
     @s3acl
     def test_bucket_DELETE(self):

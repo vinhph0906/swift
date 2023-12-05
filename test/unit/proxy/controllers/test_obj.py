@@ -23,10 +23,10 @@ import unittest
 from collections import defaultdict
 from contextlib import contextmanager
 import json
-from hashlib import md5
 
 import mock
-from eventlet import Timeout
+from eventlet import Timeout, sleep
+from eventlet.queue import Empty
 
 import six
 from six import StringIO
@@ -40,19 +40,20 @@ else:
 import swift
 from swift.common import utils, swob, exceptions
 from swift.common.exceptions import ChunkWriteTimeout
-from swift.common.utils import Timestamp, list_from_csv
+from swift.common.utils import Timestamp, list_from_csv, md5
 from swift.proxy import server as proxy_server
 from swift.proxy.controllers import obj
 from swift.proxy.controllers.base import \
     get_container_info as _real_get_container_info
 from swift.common.storage_policy import POLICIES, ECDriverError, \
     StoragePolicy, ECStoragePolicy
-
-from test.unit import FakeRing, FakeMemcache, fake_http_connect, \
-    debug_logger, patch_policies, SlowBody, FakeStatus, \
-    DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub, \
-    fake_ec_node_response, StubResponse, mocked_http_conn, \
-    quiet_eventlet_exceptions
+from swift.common.swob import Request
+from test.debug_logger import debug_logger
+from test.unit import (
+    FakeRing, fake_http_connect, patch_policies, SlowBody, FakeStatus,
+    DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
+    fake_ec_node_response, StubResponse, mocked_http_conn,
+    quiet_eventlet_exceptions)
 from test.unit.proxy.test_server import node_error_count
 
 
@@ -142,7 +143,8 @@ def make_footers_callback(body=None):
     crypto_etag = '20242af0cd21dd7195a10483eb7472c9'
     etag_crypto_meta = \
         '{"cipher": "AES_CTR_256", "iv": "sD+PSw/DfqYwpsVGSo0GEw=="}'
-    etag = md5(body).hexdigest() if body is not None else None
+    etag = md5(body,
+               usedforsecurity=False).hexdigest() if body is not None else None
     footers_to_add = {
         'X-Object-Sysmeta-Container-Update-Override-Etag': cont_etag,
         'X-Object-Sysmeta-Crypto-Etag': crypto_etag,
@@ -179,8 +181,9 @@ class BaseObjectControllerMixin(object):
         # increase connection timeout to avoid intermittent failures
         conf = {'conn_timeout': 1.0}
         self.app = PatchedObjControllerApp(
-            conf, FakeMemcache(), account_ring=FakeRing(),
+            conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=self.logger)
+        self.logger.clear()  # startup/loading debug msgs not helpful
 
         # you can over-ride the container_info just by setting it on the app
         # (see PatchedObjControllerApp for details)
@@ -217,8 +220,10 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
 
+        for node in all_nodes:
+            node['use_replication'] = False
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, Request.blank('')))
 
         self.maxDiff = None
 
@@ -242,6 +247,8 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         # limit to the number we're going to look at in this request
         nodes_requested = self.app.request_node_count(object_ring.replicas)
@@ -254,9 +261,24 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         # finally, create the local_first_nodes iter and flatten it out
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, Request.blank('')))
 
         # the local nodes move up in the ordering
+        self.assertEqual([1] * (self.replicas() + 1), [
+            node['region'] for node in local_first_nodes[
+                :self.replicas() + 1]])
+        # we don't skip any nodes
+        self.assertEqual(len(all_nodes), len(local_first_nodes))
+        self.assertEqual(sorted(all_nodes, key=lambda dev: dev['id']),
+                         sorted(local_first_nodes, key=lambda dev: dev['id']))
+
+        for node in all_nodes:
+            node['use_replication'] = True
+
+        req = Request.blank(
+            '/v1/a/c', headers={'x-backend-use-replication-network': 'yes'})
+        local_first_nodes = list(controller.iter_nodes_local_first(
+            object_ring, 1, request=req))
         self.assertEqual([1] * (self.replicas() + 1), [
             node['region'] for node in local_first_nodes[
                 :self.replicas() + 1]])
@@ -275,9 +297,11 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         object_ring = self.policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1))
+            object_ring, 1, request=Request.blank('')))
 
         # we won't have quite enough local nodes...
         self.assertEqual(len(all_nodes), self.replicas() +
@@ -305,9 +329,12 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         object_ring = policy.object_ring
         all_nodes = object_ring.get_part_nodes(1)
         all_nodes.extend(object_ring.get_more_nodes(1))
+        for node in all_nodes:
+            node['use_replication'] = False
 
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.maxDiff = None
 
@@ -324,12 +351,15 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         primary_nodes = object_ring.get_part_nodes(1)
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         all_nodes = primary_nodes + list(handoff_nodes_iter)
+        for node in all_nodes:
+            node['use_replication'] = False
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         local_handoffs = [n for n in handoff_nodes_iter if
                           policy_conf.write_affinity_is_local_fn(n)]
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -360,12 +390,17 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         primary_nodes = object_ring.get_part_nodes(1)
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         all_nodes = primary_nodes + list(handoff_nodes_iter)
+        for node in all_nodes:
+            node['use_replication'] = False
         handoff_nodes_iter = object_ring.get_more_nodes(1)
         local_handoffs = [n for n in handoff_nodes_iter if
                           policy_conf.write_affinity_is_local_fn(n)]
+        for node in local_handoffs:
+            node['use_replication'] = False
 
         prefered_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, local_handoffs_first=True))
+            object_ring, 1, local_handoffs_first=True,
+            request=Request.blank('')))
 
         self.assertEqual(len(all_nodes), self.replicas() +
                          POLICIES.default.object_ring.max_more_nodes)
@@ -969,7 +1004,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
             self, conf, policy_conf, policy, affinity_regions, affinity_count):
         conf['policy_config'] = policy_conf
         app = PatchedObjControllerApp(
-            conf, FakeMemcache(), account_ring=FakeRing(),
+            conf, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=self.logger)
 
         controller = self.controller_cls(app, 'a', 'c', 'o')
@@ -989,7 +1024,7 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
         # finally, create the local_first_nodes iter and flatten it out
         local_first_nodes = list(controller.iter_nodes_local_first(
-            object_ring, 1, policy))
+            object_ring, 1, Request.blank(''), policy))
 
         # check that the required number of local nodes were moved up the order
         node_regions = [node['region'] for node in local_first_nodes]
@@ -1077,7 +1112,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
                                               body=test_body)
         if chunked:
             req.headers['Transfer-Encoding'] = 'chunked'
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         req.headers['Etag'] = etag
 
         put_requests = defaultdict(
@@ -1212,7 +1247,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.app.sort_nodes = lambda n, *args, **kwargs: n  # disable shuffle
 
         def test_status_map(statuses, expected):
-            self.app._error_limiting = {}
+            self.app.error_limiter.stats.clear()
             req = swob.Request.blank('/v1/a/c/o.jpg', method='PUT',
                                      body=b'test body')
             with set_http_connect(*statuses):
@@ -1247,7 +1282,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         test_status_map(((507, None), 201, 201, 201), 201)
         self.assertEqual(
             node_error_count(self.app, object_ring.devs[0]),
-            self.app.error_suppression_limit + 1)
+            self.app.error_limiter.suppression_limit + 1)
         # response errors
         test_status_map(((100, Timeout()), 201, 201), 201)
         self.assertEqual(
@@ -1258,7 +1293,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         test_status_map((201, (100, 507), 201), 201)
         self.assertEqual(
             node_error_count(self.app, object_ring.devs[1]),
-            self.app.error_suppression_limit + 1)
+            self.app.error_limiter.suppression_limit + 1)
 
     def test_PUT_connect_exception_with_unicode_path(self):
         expected = 201
@@ -1363,10 +1398,14 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         req, log_lines = do_test((201, (100, 500), 201))
         if six.PY3:
             # We allow the b'' in logs because we want to see bad characters.
-            self.assertIn("ERROR 500 b'' From Object Server", log_lines[0])
+            self.assertIn(
+                "ERROR 500 b'' Trying to PUT /v1/AUTH_kilroy/%ED%88%8E/"
+                "%E9%90%89 From Object Server", log_lines[0])
             self.assertIn(req.path, log_lines[0])
         else:
-            self.assertIn('ERROR 500  From Object Server', log_lines[0])
+            self.assertIn(
+                'ERROR 500  Trying to PUT /v1/AUTH_kilroy/%ED%88%8E/%E9%90%89 '
+                'From Object Server', log_lines[0])
             self.assertIn(req.path.decode('utf-8'), log_lines[0])
 
     def test_DELETE_errors(self):
@@ -1598,6 +1637,82 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 503)
+
+    def test_HEAD_error_limit_supression_count(self):
+        def do_test(primary_codes, expected, clear_stats=True):
+            if clear_stats:
+                self.app.error_limiter.stats.clear()
+            random.shuffle(primary_codes)
+            handoff_codes = [404] * self.obj_ring.max_more_nodes
+            with set_http_connect(*primary_codes + handoff_codes):
+                req = swift.common.swob.Request.blank(
+                    '/v1/a/c/o', method='HEAD')
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, expected)
+
+        policy_opts = self.app.get_policy_options(None)
+        policy_opts.rebalance_missing_suppression_count = 1
+        # even with disks unmounted you can run with suppression_count = 1
+        do_test([507, 404, 404], 404)
+        # error limiting can make things wonky
+        do_test([404, 404], 404, clear_stats=False)
+        # and it gets a little dicy rebooting nodes
+        do_test([Timeout(), 404], 503, clear_stats=False)
+        do_test([507, Timeout(), 404], 503)
+        # unless you turn it off
+        policy_opts.rebalance_missing_suppression_count = 0
+        do_test([507, Timeout(), 404], 404)
+
+    def test_GET_primaries_error_during_rebalance(self):
+        def do_test(primary_codes, expected, include_timestamp=False):
+            random.shuffle(primary_codes)
+            handoff_codes = [404] * self.obj_ring.max_more_nodes
+            headers = None
+            if include_timestamp:
+                headers = [{'X-Backend-Timestamp': '123.456'}] * 3
+                headers.extend({} for _ in handoff_codes)
+            with set_http_connect(*primary_codes + handoff_codes,
+                                  headers=headers):
+                req = swift.common.swob.Request.blank('/v1/a/c/o')
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, expected)
+
+        # with two of out three backend errors a client should retry
+        do_test([Timeout(), Exception('kaboom!'), 404], 503)
+        # unless there's a timestamp associated
+        do_test([Timeout(), Exception('kaboom!'), 404], 404,
+                include_timestamp=True)
+        # when there's more 404s, we trust it more
+        do_test([Timeout(), 404, 404], 404)
+        # unless we explicitly *don't* want to trust it
+        policy_opts = self.app.get_policy_options(None)
+        policy_opts.rebalance_missing_suppression_count = 2
+        do_test([Timeout(), 404, 404], 503)
+
+        # overloaded primary after double rebalance
+        # ... opts should increase rebalance_missing_suppression_count
+        policy_opts.rebalance_missing_suppression_count = 2
+        do_test([Timeout(), 404, 404], 503)
+
+        # two primaries out, but no rebalance
+        # ... default is fine for tombstones
+        policy_opts.rebalance_missing_suppression_count = 1
+        do_test([Timeout(), Exception('kaboom!'), 404], 404,
+                include_timestamp=True)
+        # ... but maybe not ideal for missing names
+        # (N.B. 503 isn't really a BAD response here)
+        do_test([Timeout(), Exception('kaboom!'), 404], 503)
+        # still ... ops might think they should tune it down
+        policy_opts.rebalance_missing_suppression_count = 0
+        do_test([Timeout(), Exception('kaboom!'), 404], 404)
+        # and we could maybe leave it like this for the next rebalance
+        do_test([Timeout(), 404, 404], 404)
+        # ... but it gets bad when faced with timeouts, b/c we can't trust a
+        # single primary 404 response during rebalance
+        do_test([Timeout(), Timeout(), 404], 404)
+        # ops needs to fix configs to get the 503
+        policy_opts.rebalance_missing_suppression_count = 1
+        do_test([Timeout(), Timeout(), 404], 503)
 
     def test_GET_primaries_mixed_explode_and_timeout(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
@@ -2060,6 +2175,7 @@ def capture_http_requests(get_response):
             self.req = req
             self.resp = None
             self.path = "/"
+            self.closed = False
 
         def getresponse(self):
             self.resp = get_response(self.req)
@@ -2073,6 +2189,9 @@ def capture_http_requests(get_response):
 
         def endheaders(self):
             pass
+
+        def close(self):
+            self.closed = True
 
     class ConnectionLog(object):
 
@@ -2157,7 +2276,8 @@ class ECObjectControllerMixin(CommonObjectControllerMixin):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # expect a request to all primaries plus one handoff
         self.assertEqual(self.replicas() + 1, len(log))
@@ -2275,12 +2395,65 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         get_statuses = [200] * self.policy.ec_ndata
-        get_hdrs = [{'Connection': 'close'}] * self.policy.ec_ndata
+        get_hdrs = [{
+            'Connection': 'close',
+            'X-Object-Sysmeta-Ec-Scheme': self.policy.ec_scheme_description,
+        }] * self.policy.ec_ndata
         with set_http_connect(*get_statuses, headers=get_hdrs):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
         self.assertNotIn('Connection', resp.headers)
+        self.assertFalse([h for h in resp.headers
+                          if h.lower().startswith('x-object-sysmeta-ec-')])
+
+    def test_GET_disconnect(self):
+        self.app.recoverable_node_timeout = 0.01
+        self.app.client_timeout = 0.1
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-743]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+        num_slow = 4
+        responses = [
+            (200, SlowBody(body, 0.1 if i < num_slow else 0.0),
+             self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies)
+        ] * self.policy.ec_duplication_factor
+
+        status_codes, body_iter, headers = zip(*responses)
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            resp.app_iter.close()
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_ndata + num_slow)
+
+        def make_key(r):
+            r['device'] = r['path'].split('/')[1]
+            return '%(ip)s:%(port)s/%(device)s' % r
+        # the first four slow nodes get errors incr'd
+        expected_error_limiting = {
+            make_key(r): {
+                'errors': 1,
+                'last_error': mock.ANY,
+            }
+            for r in log.requests[:4]
+        }
+        actual = {}
+        for n in self.app.get_object_ring(int(self.policy)).devs:
+            node_key = self.app.error_limiter.node_key(n)
+            stats = self.app.error_limiter.stats.get(node_key) or {}
+            if stats:
+                actual[self.app.error_limiter.node_key(n)] = stats
+        self.assertEqual(actual, expected_error_limiting)
 
     def test_GET_not_found_when_404_newer(self):
         # if proxy receives a 404, it keeps waiting for other connections until
@@ -2291,6 +2464,31 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         codes = [200, 404] + [200] * rest
         ts_iter = iter([1, 2] + [1] * rest)
         with set_http_connect(*codes, timestamps=ts_iter):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+
+    def test_GET_primaries_error_during_rebalance(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        codes = [404] * (2 * self.policy.object_ring.replica_count)
+        with mocked_http_conn(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 404)
+        for i in range(self.policy.object_ring.replica_count - 2):
+            codes[i] = Timeout()
+            with mocked_http_conn(*codes):
+                resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 404)
+            self.app.error_limiter.stats.clear()  # Reset error limiting
+
+        # one more timeout is past the tipping point
+        codes[self.policy.object_ring.replica_count - 2] = Timeout()
+        with mocked_http_conn(*codes):
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+        self.app.error_limiter.stats.clear()  # Reset error limiting
+
+        # unless we have tombstones
+        with mocked_http_conn(*codes, headers={'X-Backend-Timestamp': '1'}):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
@@ -2411,6 +2609,325 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
+    def test_GET_no_response_error(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        with set_http_connect():
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 503)
+
+    def test_feed_remaining_primaries(self):
+        controller = self.controller_cls(
+            self.app, 'a', 'c', 'o')
+        safe_iter = utils.GreenthreadSafeIterator(self.app.iter_nodes(
+            self.policy.object_ring, 0, self.logger, policy=self.policy,
+            request=Request.blank('')))
+        controller._fragment_GET_request = lambda *a, **k: next(safe_iter)
+        pile = utils.GreenAsyncPile(self.policy.ec_ndata)
+        for i in range(self.policy.ec_ndata):
+            pile.spawn(controller._fragment_GET_request)
+        req = swob.Request.blank('/v1/a/c/o')
+
+        feeder_q = mock.MagicMock()
+
+        def feeder_timeout(*a, **kw):
+            # simulate trampoline
+            sleep()
+            # timeout immediately
+            raise Empty
+        feeder_q.get.side_effect = feeder_timeout
+        controller.feed_remaining_primaries(
+            safe_iter, pile, req, 0, self.policy,
+            mock.MagicMock(), feeder_q, mock.MagicMock())
+        expected_timeout = self.app.get_policy_options(
+            self.policy).concurrency_timeout
+        expected_call = mock.call(timeout=expected_timeout)
+        expected_num_calls = self.policy.ec_nparity + 1
+        self.assertEqual(feeder_q.get.call_args_list,
+                         [expected_call] * expected_num_calls)
+
+    def test_GET_timeout(self):
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        self.app.recoverable_node_timeout = 0.01
+        codes = [FakeStatus(404, response_sleep=1.0)] * 2 + \
+            [200] * (self.policy.ec_ndata)
+        with mocked_http_conn(*codes) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(self.policy.ec_ndata + 2, len(log.requests))
+        self.assertEqual(
+            len(self.logger.logger.records['ERROR']), 2,
+            'Expected 2 ERROR lines, got %r' % (
+                self.logger.logger.records['ERROR'], ))
+        for retry_line in self.logger.logger.records['ERROR']:
+            self.assertIn('ERROR with Object server', retry_line)
+            self.assertIn('Trying to GET', retry_line)
+            self.assertIn('Timeout (0.01s)', retry_line)
+            self.assertIn(req.headers['x-trans-id'], retry_line)
+
+    def test_GET_with_slow_primaries(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-743]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrency_timeout = 0.1
+
+        status_codes = ([
+            FakeStatus(200, response_sleep=2.0),
+        ] * self.policy.ec_nparity) + ([
+            FakeStatus(200),
+        ] * self.policy.ec_ndata)
+        self.assertEqual(len(status_codes), len(ec_archive_bodies))
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_n_unique_fragments)
+
+    def test_GET_with_some_slow_primaries(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-289]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrency_timeout = 0.1
+
+        slow_count = self.policy.ec_nparity
+        status_codes = ([
+            FakeStatus(200, response_sleep=2.0),
+        ] * slow_count) + ([
+            FakeStatus(200),
+        ] * (self.policy.ec_ndata - slow_count))
+        random.shuffle(status_codes)
+        status_codes.extend([
+            FakeStatus(200),
+        ] * slow_count)
+        self.assertEqual(len(status_codes), len(ec_archive_bodies))
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_n_unique_fragments)
+
+    def test_ec_concurrent_GET_with_slow_leaders(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-289]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrency_timeout = 0.0
+
+        slow_count = 4
+        status_codes = ([
+            FakeStatus(200, response_sleep=0.2),
+        ] * slow_count) + ([
+            FakeStatus(200, response_sleep=0.1),
+        ] * (self.policy.ec_n_unique_fragments - slow_count))
+        for i in range(slow_count):
+            # poison the super slow requests
+            ec_archive_bodies[i] = ''
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, test_data, '%r != %r' % (
+                resp.body if len(resp.body) < 60 else '%s...' % resp.body[:60],
+                test_data if len(test_data) < 60 else '%s...' % test_data[:60],
+            ))
+        self.assertEqual(len(log.requests), self.policy.ec_n_unique_fragments)
+
+    def test_GET_with_slow_nodes_and_failures(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-289]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrency_timeout = 0.1
+
+        unused_resp = [
+            FakeStatus(200, response_sleep=2.0),
+            FakeStatus(200, response_sleep=2.0),
+            500,
+            416,
+        ]
+        self.assertEqual(len(unused_resp), self.policy.ec_nparity)
+        status_codes = (
+            [200] * (self.policy.ec_ndata - 4)) + unused_resp
+        self.assertEqual(len(status_codes), self.policy.ec_ndata)
+        # random.shuffle(status_codes)
+        # make up for the failures
+        status_codes.extend([200] * self.policy.ec_nparity)
+        self.assertEqual(len(status_codes), len(ec_archive_bodies))
+        bodies_with_errors = []
+        for code, body in zip(status_codes, ec_archive_bodies):
+            if code == 500:
+                bodies_with_errors.append('Kaboom')
+            elif code == 416:
+                bodies_with_errors.append('That Range is no.')
+            else:
+                bodies_with_errors.append(body)
+        with mocked_http_conn(*status_codes, body_iter=bodies_with_errors,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_n_unique_fragments)
+
+    def test_GET_with_one_slow_frag_lane(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-454]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_gets = True
+        policy_opts.concurrency_timeout = 0.1
+
+        status_codes = [
+            FakeStatus(200, response_sleep=2.0),
+        ] + ([
+            FakeStatus(200),
+        ] * (self.policy.ec_ndata - 1))
+        random.shuffle(status_codes)
+        status_codes.extend([
+            FakeStatus(200, response_sleep=2.0),
+            FakeStatus(200, response_sleep=2.0),
+            FakeStatus(200, response_sleep=2.0),
+            FakeStatus(200),
+        ])
+        self.assertEqual(len(status_codes), len(ec_archive_bodies))
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests),
+                         self.policy.ec_n_unique_fragments)
+
+    def test_GET_with_concurrent_ec_extra_requests(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-454]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        ts = self.ts()
+        headers = []
+        for i, body in enumerate(ec_archive_bodies):
+            headers.append({
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(body),
+                'X-Object-Sysmeta-Ec-Frag-Index':
+                    self.policy.get_backend_index(i),
+                'X-Backend-Timestamp': ts.internal,
+                'X-Timestamp': ts.normal,
+                'X-Backend-Durable-Timestamp': ts.internal,
+                'X-Backend-Data-Timestamp': ts.internal,
+            })
+        policy_opts = self.app.get_policy_options(self.policy)
+        policy_opts.concurrent_ec_extra_requests = self.policy.ec_nparity - 1
+        req = swift.common.swob.Request.blank('/v1/a/c/o')
+        # w/o concurrent_gets ec_extra_requests has no effect
+        status_codes = [200] * self.policy.ec_ndata
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests), self.policy.ec_ndata)
+        self.assertEqual(resp.body, test_data)
+
+        policy_opts.concurrent_gets = True
+        status_codes = [200] * (self.policy.object_ring.replicas - 1)
+        with mocked_http_conn(*status_codes, body_iter=ec_archive_bodies,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(len(log.requests),
+                         self.policy.object_ring.replicas - 1)
+        self.assertEqual(resp.body, test_data)
+
     def test_GET_with_body(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         # turn a real body into fragments
@@ -2451,7 +2968,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
     def test_GET_with_frags_swapped_around(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-657]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
 
         _part, primary_nodes = self.obj_ring.get_nodes('a', 'c', 'o')
@@ -2535,7 +3052,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         collected_responses = defaultdict(list)
         for conn in log:
@@ -2576,12 +3094,23 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         fake_response = self._fake_ec_node_response(node_frags)
 
         req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response) as log:
+        with mock.patch('swift.proxy.server.shuffle', lambda n: n), \
+                capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        closed_conn = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            closed_conn[etag].add(conn.closed)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {False},
+        }, closed_conn)
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
+        self.assertEqual({True}, {conn.closed for conn in log})
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -2589,17 +3118,13 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             index = conn.resp.headers['X-Object-Sysmeta-Ec-Frag-Index']
             collected_responses[etag].add(index)
 
-        # because the primary nodes are shuffled, it's possible the proxy
-        # didn't even notice the missed overwrite frag - but it might have
-        self.assertLessEqual(len(log), self.policy.ec_ndata + 1)
-        self.assertLessEqual(len(collected_responses), 2)
-
-        # ... regardless we should never need to fetch more than ec_ndata
-        # frags for any given etag
-        for etag, frags in collected_responses.items():
-            self.assertLessEqual(len(frags), self.policy.ec_ndata,
-                                 'collected %s frags for etag %s' % (
-                                     len(frags), etag))
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+        expected = {
+            obj1['etag']: 1,
+            obj2['etag']: self.policy.ec_ndata,
+        }
+        self.assertEqual(expected, {
+            e: len(f) for e, f in collected_responses.items()})
 
     def test_GET_with_many_missed_overwrite_will_need_handoff(self):
         obj1 = self._make_ec_object_stub(pattern='obj1')
@@ -2631,7 +3156,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -2695,7 +3221,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -2758,6 +3285,15 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
+        closed_conn = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+            closed_conn[etag].add(conn.closed)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {True},
+            None: {True},
+        }, dict(closed_conn))
         self.assertEqual(resp.status_int, 503)
 
         collected_responses = defaultdict(set)
@@ -2806,7 +3342,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # Expect a maximum of one request to each primary plus one extra
         # request to node 1. Actual value could be less if the extra request
@@ -2857,7 +3394,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                 collected_indexes[fi].append(conn)
         self.assertEqual(len(collected_indexes), 7)
 
-    def test_GET_with_mixed_nondurable_frags_and_no_quorum_will_503(self):
+    def test_GET_with_mixed_nondurable_frags_and_will_404(self):
         # all nodes have a frag but there is no one set that reaches quorum,
         # which means there is no backend 404 response, but proxy should still
         # return 404 rather than 503
@@ -2907,10 +3444,12 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         collected_etags = set()
         collected_status = set()
+        closed_conn = defaultdict(set)
         for conn in log:
             etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
             collected_etags.add(etag)
             collected_status.add(conn.resp.status)
+            closed_conn[etag].add(conn.closed)
 
         # default node_iter will exhaust at 2 * replicas
         self.assertEqual(len(log), 2 * self.replicas())
@@ -2918,11 +3457,87 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             {obj1['etag'], obj2['etag'], obj3['etag'], obj4['etag']},
             collected_etags)
         self.assertEqual({200}, collected_status)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {True},
+            obj3['etag']: {True},
+            obj4['etag']: {True},
+        }, closed_conn)
 
-    def test_GET_with_mixed_frags_and_no_quorum_will_503(self):
+    def test_GET_with_mixed_durable_and_nondurable_frags_will_503(self):
         # all nodes have a frag but there is no one set that reaches quorum,
-        # but since they're all marked durable (so we *should* be able to
-        # reconstruct), proxy will 503
+        # but since one is marked durable we *should* be able to reconstruct,
+        # so proxy should 503
+        obj1 = self._make_ec_object_stub(pattern='obj1')
+        obj2 = self._make_ec_object_stub(pattern='obj2')
+        obj3 = self._make_ec_object_stub(pattern='obj3')
+        obj4 = self._make_ec_object_stub(pattern='obj4')
+
+        node_frags = [
+            {'obj': obj1, 'frag': 0, 'durable': False},
+            {'obj': obj2, 'frag': 0, 'durable': False},
+            {'obj': obj3, 'frag': 0, 'durable': False},
+            {'obj': obj1, 'frag': 1, 'durable': False},
+            {'obj': obj2, 'frag': 1, 'durable': False},
+            {'obj': obj3, 'frag': 1, 'durable': False},
+            {'obj': obj1, 'frag': 2, 'durable': False},
+            {'obj': obj2, 'frag': 2, 'durable': False},
+            {'obj': obj3, 'frag': 2, 'durable': False},
+            {'obj': obj1, 'frag': 3, 'durable': False},
+            {'obj': obj2, 'frag': 3, 'durable': False},
+            {'obj': obj3, 'frag': 3, 'durable': False},
+            {'obj': obj1, 'frag': 4, 'durable': False},
+            {'obj': obj2, 'frag': 4, 'durable': False},
+            {'obj': obj3, 'frag': 4, 'durable': False},
+            {'obj': obj1, 'frag': 5, 'durable': False},
+            {'obj': obj2, 'frag': 5, 'durable': False},
+            {'obj': obj3, 'frag': 5, 'durable': False},
+            {'obj': obj1, 'frag': 6, 'durable': False},
+            {'obj': obj2, 'frag': 6, 'durable': False},
+            {'obj': obj3, 'frag': 6, 'durable': False},
+            {'obj': obj1, 'frag': 7, 'durable': False},
+            {'obj': obj2, 'frag': 7, 'durable': False},
+            {'obj': obj3, 'frag': 7},
+            {'obj': obj1, 'frag': 8, 'durable': False},
+            {'obj': obj2, 'frag': 8, 'durable': False},
+            {'obj': obj3, 'frag': 8, 'durable': False},
+            {'obj': obj4, 'frag': 8, 'durable': False},
+        ]
+
+        fake_response = self._fake_ec_node_response(node_frags)
+
+        req = swob.Request.blank('/v1/a/c/o')
+        with capture_http_requests(fake_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 503)
+
+        closed_conn = defaultdict(set)
+        collected_etags = set()
+        collected_status = set()
+        for conn in log:
+            etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
+            collected_etags.add(etag)
+            collected_status.add(conn.resp.status)
+            closed_conn[etag].add(conn.closed)
+
+        # default node_iter will exhaust at 2 * replicas
+        self.assertEqual(len(log), 2 * self.replicas())
+        self.assertEqual(
+            {obj1['etag'], obj2['etag'], obj3['etag'], obj4['etag']},
+            collected_etags)
+        self.assertEqual({200}, collected_status)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {True},
+            obj3['etag']: {True},
+            obj4['etag']: {True},
+        }, closed_conn)
+
+    def test_GET_with_mixed_durable_frags_and_no_quorum_will_503(self):
+        # all nodes have a frag but there is no one set that reaches quorum,
+        # and since at least one is marked durable we *should* be able to
+        # reconstruct, so proxy will 503
         obj1 = self._make_ec_object_stub(pattern='obj1')
         obj2 = self._make_ec_object_stub(pattern='obj2')
         obj3 = self._make_ec_object_stub(pattern='obj3')
@@ -2967,12 +3582,17 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 503)
 
+        for conn in log:
+            etag = conn.resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+
         collected_etags = set()
         collected_status = set()
+        closed_conn = defaultdict(set)
         for conn in log:
             etag = conn.resp.headers['X-Object-Sysmeta-Ec-Etag']
             collected_etags.add(etag)
             collected_status.add(conn.resp.status)
+            closed_conn[etag].add(conn.closed)
 
         # default node_iter will exhaust at 2 * replicas
         self.assertEqual(len(log), 2 * self.replicas())
@@ -2980,6 +3600,12 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             {obj1['etag'], obj2['etag'], obj3['etag'], obj4['etag']},
             collected_etags)
         self.assertEqual({200}, collected_status)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {True},
+            obj3['etag']: {True},
+            obj4['etag']: {True},
+        }, closed_conn)
 
     def test_GET_with_quorum_durable_files(self):
         # verify that only (ec_nparity + 1) nodes need to be durable for a GET
@@ -3001,7 +3627,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             {'obj': obj1, 'frag': 11, 'durable': False},  # parity
             {'obj': obj1, 'frag': 12, 'durable': False},  # parity
             {'obj': obj1, 'frag': 13, 'durable': False},  # parity
-        ]  # handoffs not used in this scenario
+        ] + [[]] * self.replicas()  # handoffs all 404
 
         fake_response = self._fake_ec_node_response(list(node_frags))
 
@@ -3011,11 +3637,14 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
-        self.assertEqual(self.policy.ec_ndata, len(log))
+        self.assertGreaterEqual(len(log), self.policy.ec_ndata)
         collected_durables = []
         for conn in log:
+            if not conn.resp.headers.get('X-Backend-Data-Timestamp'):
+                continue
             if (conn.resp.headers.get('X-Backend-Durable-Timestamp')
                     == conn.resp.headers.get('X-Backend-Data-Timestamp')):
                 collected_durables.append(conn)
@@ -3044,7 +3673,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             {'obj': obj1, 'frag': 11, 'durable': False},  # parity
             {'obj': obj1, 'frag': 12, 'durable': False},  # parity
             {'obj': obj1, 'frag': 13, 'durable': False},  # parity
-        ]  # handoffs not used in this scenario
+        ] + [[]] * self.replicas()  # handoffs all 404
 
         fake_response = self._fake_ec_node_response(list(node_frags))
 
@@ -3054,10 +3683,13 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         collected_durables = []
         for conn in log:
+            if not conn.resp.headers.get('X-Backend-Data-Timestamp'):
+                continue
             if (conn.resp.headers.get('X-Backend-Durable-Timestamp')
                     == conn.resp.headers.get('X-Backend-Data-Timestamp')):
                 collected_durables.append(conn)
@@ -3129,12 +3761,22 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         fake_response = self._fake_ec_node_response(list(node_frags))
 
         req = swob.Request.blank('/v1/a/c/o')
-        with capture_http_requests(fake_response):
+        with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
+
+        closed_conn = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+            closed_conn[etag].add(conn.closed)
+        self.assertEqual({
+            obj1['etag']: {False},
+            obj2['etag']: {True},
+        }, closed_conn)
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
         # Quorum of non-durables for a different object won't
         # prevent us hunting down the durable object
@@ -3179,7 +3821,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj1['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj1['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj1['etag'])
 
     def test_GET_with_missing_durables_and_older_durables(self):
         # scenario: non-durable frags of newer obj1 obscure all durable frags
@@ -3223,14 +3866,25 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(fake_response) as log:
             resp = req.get_response(self.app)
 
+        closed_conn = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+            closed_conn[etag].add(conn.closed)
+        self.assertEqual({
+            obj1['etag']: {True},
+            obj2['etag']: {False},
+        }, closed_conn)
+
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
         # max: proxy will GET all non-durable obj1 frags and then 10 obj frags
         self.assertLessEqual(len(log), self.replicas() + self.policy.ec_ndata)
         # min: proxy will GET 10 non-durable obj1 frags and then 10 obj frags
         self.assertGreaterEqual(len(log), 2 * self.policy.ec_ndata)
 
+    def test_GET_with_missing_durables_and_older_obscured_durables(self):
         # scenario: obj3 has 14 frags but only 2 are durable and these are
         # obscured by two non-durable frags of obj1. There is also a single
         # non-durable frag of obj2. The proxy will need to do at least 10
@@ -3259,7 +3913,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             [{'obj': obj3, 'frag': 11, 'durable': False}],
             [{'obj': obj3, 'frag': 12, 'durable': False}],
             [{'obj': obj3, 'frag': 13, 'durable': False}],
-        ]
+        ] + [[]] * self.replicas()  # handoffs 404
 
         fake_response = self._fake_ec_node_response(list(node_frags))
 
@@ -3269,9 +3923,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj3['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj3['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj3['etag'])
         self.assertGreaterEqual(len(log), self.policy.ec_ndata + 1)
-        self.assertLessEqual(len(log), self.policy.ec_ndata + 4)
+        self.assertLessEqual(len(log), (self.policy.ec_ndata * 2) + 1)
 
     def test_GET_with_missing_durables_and_older_non_durables(self):
         # scenario: non-durable frags of newer obj1 obscure all frags
@@ -3316,7 +3971,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(md5(
+            resp.body, usedforsecurity=False).hexdigest(), obj2['etag'])
         # max: proxy will GET all non-durable obj1 frags and then 10 obj2 frags
         self.assertLessEqual(len(log), self.replicas() + self.policy.ec_ndata)
         # min: proxy will GET 10 non-durable obj1 frags and then 10 obj2 frags
@@ -3453,7 +4109,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             StubResponse(416, frag_index=4),
             StubResponse(416, frag_index=5),
             StubResponse(416, frag_index=6),
-            # sneak in bogus extra responses
+            # sneak a couple bogus extra responses
             StubResponse(404),
             StubResponse(206, frag_index=8),
             # and then just "enough" more 416's
@@ -3471,8 +4127,10 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 416)
-        # ec_ndata responses that must agree, plus the bogus extras
-        self.assertEqual(len(log), self.policy.ec_ndata + 2)
+        # we're going to engage ndata primaries, plus the bogus extra
+        # self.assertEqual(len(log), self.policy.ec_ndata + 2)
+        self.assertEqual([c.resp.status for c in log],
+                         ([416] * 7) + [404, 206] + ([416] * 3))
 
     def test_GET_with_missing_and_range_unsatisifiable(self):
         responses = [  # not quite ec_ndata frags on primaries
@@ -3499,6 +4157,309 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # a non-range GET of same object would return 404
         self.assertEqual(resp.status_int, 416)
         self.assertEqual(len(log), 2 * self.replicas())
+
+    @patch_policies(
+        [ECStoragePolicy(0, name='ec', is_default=True,
+                         ec_type=DEFAULT_TEST_EC_TYPE, ec_ndata=4,
+                         ec_nparity=4, ec_segment_size=4096)],
+        fake_ring_args=[{'replicas': 8}]
+    )
+    def test_GET_ndata_equals_nparity_with_missing_and_errors(self):
+        # when ec_ndata == ec_nparity it is possible for the shortfall of a bad
+        # bucket (412's) to equal ec_ndata; verify that the 412 bucket is still
+        # chosen ahead of the initial 'dummy' bad bucket
+        POLICIES.default.object_ring.max_more_nodes = 8
+        responses = [
+            StubResponse(412, frag_index=0),
+            StubResponse(412, frag_index=1),
+        ]
+
+        def get_response(req):
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=%s-' % 100000000000000})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+
+        self.assertEqual(resp.status_int, 412)
+        self.assertEqual(len(log), 2 * 8)
+
+    def test_GET_with_multirange(self):
+        self.app.object_chunk_size = 256
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           in ec_stub['frags'][:self.policy.ec_ndata]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+
+        def get_response(req):
+            # there's some math going on here I don't quite understand, the
+            # fragment_size is 490 and there's like 4 of them because ec_body
+            # is 'test' * segment_size
+            self.assertEqual(req['headers']['Range'], 'bytes=0-489,1470-1959')
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(len(log), self.policy.ec_ndata)
+        resp_boundary = resp.headers['content-type'].rsplit('=', 1)[1].encode()
+        expected = b'\r\n'.join([
+            b'--' + resp_boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 1000-2000/16384',
+            b'',
+            ec_stub['body'][1000:2001],
+            b'--' + resp_boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 14000-15000/16384',
+            b'',
+            ec_stub['body'][14000:15001],
+            b'--' + resp_boundary + b'--',
+        ])
+        self.assertEqual(resp.body, expected)
+
+    def test_GET_with_multirange_slow_body(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           in ec_stub['frags'][:self.policy.ec_ndata + 1]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i,
+                         # make the first one slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+
+        def get_response(req):
+            # there's some math going on here I don't quite understand, the
+            # fragment_size is 490 and there's like 4 of them because ec_body
+            # is 'test' * segment_size
+            self.assertEqual(req['headers']['Range'], 'bytes=0-489,1470-1959')
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+        resp_boundary = resp.headers['content-type'].rsplit('=', 1)[1].encode()
+        expected = b'\r\n'.join([
+            b'--' + resp_boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 1000-2000/16384',
+            b'',
+            ec_stub['body'][1000:2001],
+            b'--' + resp_boundary,
+            b'Content-Type: application/octet-stream',
+            b'Content-Range: bytes 14000-15000/16384',
+            b'',
+            ec_stub['body'][14000:15001],
+            b'--' + resp_boundary + b'--',
+        ])
+        self.assertEqual(resp.body, expected)
+
+    def test_GET_with_multirange_unable_to_resume(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           # no extra good responses
+                           in ec_stub['frags'][:self.policy.ec_ndata]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i,
+                         # make the first one slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+
+        def get_response(req):
+            # there's some math going on here I don't quite understand, the
+            # fragment_size is 490 and there's like 4 of them because ec_body
+            # is 'test' * segment_size
+            self.assertEqual(req['headers']['Range'], 'bytes=0-489,1470-1959')
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(resp.status_int, 500)
+        self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
+        log_lines = self.app.logger.get_lines_for_level('error')
+        # not the most graceful ending
+        self.assertIn('Unhandled exception', log_lines[-1])
+
+    def test_GET_with_multirange_short_resume_body(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        test_body = b'test' * self.policy.ec_segment_size
+        ec_stub = make_ec_object_stub(test_body, self.policy, None)
+        frag_archives = ec_stub['frags']
+        self.assertEqual(len(frag_archives[0]), 1960)
+        boundary = b'81eb9c110b32ced5fe'
+
+        def make_mime_body(frag_archive):
+            return b'\r\n'.join([
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 0-489/1960',
+                b'',
+                frag_archive[0:490],
+                b'--' + boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1470-1959/1960',
+                b'',
+                frag_archive[1470:],
+                b'--' + boundary + b'--',
+            ])
+
+        obj_resp_bodies = [make_mime_body(fa) for fa
+                           # no extra good responses
+                           in ec_stub['frags'][:self.policy.ec_ndata]]
+
+        headers = {
+            'Content-Type': b'multipart/byteranges;boundary=' + boundary,
+            'Content-Length': len(obj_resp_bodies[0]),
+            'X-Object-Sysmeta-Ec-Content-Length': len(ec_stub['body']),
+            'X-Object-Sysmeta-Ec-Etag': ec_stub['etag'],
+            'X-Timestamp': Timestamp(self.ts()).normal,
+        }
+
+        responses = [
+            StubResponse(206, body, headers, i,
+                         # make the first one slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(obj_resp_bodies)
+        ]
+        # add a short read response for the resume
+        short_body = obj_resp_bodies[0][:512]
+        responses.append(StubResponse(206, short_body, headers, 0))
+
+        def get_response(req):
+            # there's some math going on here I don't quite understand, the
+            # fragment_size is 490 and there's like 4 of them because ec_body
+            # is 'test' * segment_size
+            self.assertEqual(req['headers']['Range'], 'bytes=0-489,1470-1959')
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=1000-2000,14000-15000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            resp_boundary = resp.headers['content-type'].rsplit(
+                '=', 1)[1].encode()
+            expected = b'\r\n'.join([
+                b'--' + resp_boundary,
+                b'Content-Type: application/octet-stream',
+                b'Content-Range: bytes 1000-2000/16384',
+                b'',
+                b'',
+                b'--' + resp_boundary + b'--',
+            ])
+            self.assertEqual(expected, resp.body)
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(len(log), self.policy.ec_n_unique_fragments * 2)
+        log_lines = self.app.logger.get_lines_for_level('error')
+        self.assertIn("Trying to read next part of EC multi-part "
+                      "GET (retrying)", log_lines[0])
+        # not the most graceful ending
+        self.assertIn("Exception fetching fragments for '/a/c/o'",
+                      log_lines[-1])
 
     def test_GET_with_success_and_507_will_503(self):
         responses = [  # only 9 good nodes
@@ -3548,14 +4509,214 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(len(log), 2 * self.replicas())
 
+    def test_ranged_get(self):
+        self.app.object_chunk_size = 256
+        segment_size = self.policy.ec_segment_size
+        frag_size = self.policy.fragment_size
+        data = (b'test' * segment_size)[:-492]
+        etag = md5(data).hexdigest()
+        archives = self._make_ec_archive_bodies(data)
+        frag_archive_size = len(archives[0])
+        range_size = frag_size * 2
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': range_size,
+            'Content-Range': 'bytes 0-%s/%s' % (range_size - 1,
+                                                frag_archive_size),
+            'X-Object-Sysmeta-Ec-Content-Length': len(data),
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Backend-Timestamp': Timestamp(self.ts()).internal
+        }
+        responses = [
+            StubResponse(206, body[:range_size], headers, i)
+            for i, body in enumerate(archives[:self.policy.ec_ndata])
+        ]
+
+        obj_req_ranges = set()
+
+        def get_response(req):
+            obj_req_ranges.add(req['headers']['Range'])
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=3000-5000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+        self.assertEqual(obj_req_ranges, {'bytes=0-%s' % (range_size - 1)})
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(resp.headers['Content-Range'],
+                         'bytes 3000-5000/%s' % len(data))
+        self.assertEqual(resp.body, data[3000:5001])
+        self.assertEqual(len(log), self.policy.ec_ndata)
+
+    def test_ranged_get_with_slow_resp(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        segment_size = self.policy.ec_segment_size
+        frag_size = self.policy.fragment_size
+        data = (b'test' * segment_size)[:-492]
+        etag = md5(data).hexdigest()
+        archives = self._make_ec_archive_bodies(data)
+        frag_archive_size = len(archives[0])
+        range_size = frag_size * 2
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': range_size,
+            'Content-Range': 'bytes 0-%s/%s' % (range_size - 1,
+                                                frag_archive_size),
+            'X-Object-Sysmeta-Ec-Content-Length': len(data),
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Backend-Timestamp': Timestamp(self.ts()).internal
+        }
+        responses = [
+            StubResponse(206, body[:range_size], headers, i,
+                         # the first body comes up slow
+                         slowdown=0.1 if i == 0 else None)
+            for i, body in enumerate(archives[:self.policy.ec_ndata])
+        ]
+        responses.append(StubResponse(
+            206, archives[self.policy.ec_ndata][:range_size],
+            headers, self.policy.ec_ndata))
+
+        obj_req_ranges = set()
+
+        def get_response(req):
+            obj_req_ranges.add(req['headers']['Range'])
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=3000-5000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.body, data[3000:5001])
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(obj_req_ranges, {'bytes=0-%s' % (range_size - 1)})
+        self.assertEqual(resp.headers['Content-Range'],
+                         'bytes 3000-5000/%s' % len(data))
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+
+    def test_ranged_get_with_short_resp(self):
+        self.app.object_chunk_size = 256
+        segment_size = self.policy.ec_segment_size
+        frag_size = self.policy.fragment_size
+        data = (b'test' * segment_size)[:-492]
+        etag = md5(data).hexdigest()
+        archives = self._make_ec_archive_bodies(data)
+        frag_archive_size = len(archives[0])
+        range_size = frag_size * 2
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': range_size,
+            'Content-Range': 'bytes 0-%s/%s' % (range_size - 1,
+                                                frag_archive_size),
+            'X-Object-Sysmeta-Ec-Content-Length': len(data),
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Backend-Timestamp': Timestamp(self.ts()).internal
+        }
+        responses = [
+            StubResponse(
+                206,
+                # the first body comes up short
+                body[:frag_size] if i == 0 else body[:range_size],
+                headers, i)
+            for i, body in enumerate(archives[:self.policy.ec_ndata])
+        ]
+        responses.append(StubResponse(
+            206, archives[self.policy.ec_ndata][frag_size:range_size], {
+                'Content-Type': 'text/plain',
+                'Content-Length': frag_size,
+                'Content-Range': 'bytes %s-%s/%s' % (
+                    frag_size, range_size - 1, frag_archive_size),
+                'X-Object-Sysmeta-Ec-Content-Length': len(data),
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Timestamp': Timestamp(self.ts()).internal,
+            }, self.policy.ec_ndata))
+
+        obj_req_ranges = []
+
+        def get_response(req):
+            obj_req_ranges.append(req['headers']['Range'])
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=3000-5000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.body, data[3000:5001])
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(obj_req_ranges,
+                         ['bytes=0-%s' % (range_size - 1)] *
+                         self.policy.ec_ndata +
+                         ['bytes=%s-%s' % (frag_size, range_size - 1)])
+        self.assertEqual(resp.headers['Content-Range'],
+                         'bytes 3000-5000/%s' % len(data))
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+
+    def test_ranged_get_with_short_resp_timeout(self):
+        self.app.object_chunk_size = 256
+        self.app.recoverable_node_timeout = 0.01
+        segment_size = self.policy.ec_segment_size
+        frag_size = self.policy.fragment_size
+        data = (b'test' * segment_size)[:-492]
+        etag = md5(data).hexdigest()
+        archives = self._make_ec_archive_bodies(data)
+        frag_archive_size = len(archives[0])
+        range_size = frag_size * 2
+        headers = {
+            'Content-Type': 'text/plain',
+            'Content-Length': range_size,
+            'Content-Range': 'bytes 0-%s/%s' % (range_size - 1,
+                                                frag_archive_size),
+            'X-Object-Sysmeta-Ec-Content-Length': len(data),
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Backend-Timestamp': Timestamp(self.ts()).internal
+        }
+        responses = [
+            StubResponse(
+                206, body[:range_size], headers, i,
+                # the first body slows down after awhile
+                slowdown=[None] * 3 + [0.1] if i == 0 else None)
+            for i, body in enumerate(archives[:self.policy.ec_ndata])
+        ]
+        responses.append(StubResponse(
+            206, archives[self.policy.ec_ndata][frag_size:range_size], {
+                'Content-Type': 'text/plain',
+                'Content-Length': frag_size,
+                'Content-Range': 'bytes %s-%s/%s' % (
+                    frag_size, range_size - 1, frag_archive_size),
+                'X-Object-Sysmeta-Ec-Content-Length': len(data),
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Backend-Timestamp': Timestamp(self.ts()).internal,
+            }, self.policy.ec_ndata))
+
+        obj_req_ranges = []
+
+        def get_response(req):
+            obj_req_ranges.append(req['headers']['Range'])
+            return responses.pop(0) if responses else StubResponse(404)
+
+        req = swob.Request.blank('/v1/a/c/o', headers={
+            'Range': 'bytes=3000-5000'})
+        with capture_http_requests(get_response) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.body, data[3000:5001])
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(['bytes=0-%s' % (range_size - 1)] *
+                         self.policy.ec_ndata +
+                         ['bytes=%s-%s' % (frag_size, range_size - 1)],
+                         obj_req_ranges)
+        self.assertEqual(resp.headers['Content-Range'],
+                         'bytes 3000-5000/%s' % len(data))
+        self.assertEqual(len(log), self.policy.ec_ndata + 1)
+
     def test_GET_mixed_ranged_responses_success(self):
         segment_size = self.policy.ec_segment_size
         frag_size = self.policy.fragment_size
         new_data = (b'test' * segment_size)[:-492]
-        new_etag = md5(new_data).hexdigest()
+        new_etag = md5(new_data, usedforsecurity=False).hexdigest()
         new_archives = self._make_ec_archive_bodies(new_data)
         old_data = (b'junk' * segment_size)[:-492]
-        old_etag = md5(old_data).hexdigest()
+        old_etag = md5(old_data, usedforsecurity=False).hexdigest()
         old_archives = self._make_ec_archive_bodies(old_data)
         frag_archive_size = len(new_archives[0])
 
@@ -3612,6 +4773,16 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         with capture_http_requests(get_response) as log:
             resp = req.get_response(self.app)
 
+        closed_conn = defaultdict(set)
+        for conn in log:
+            etag = conn.resp.headers.get('X-Object-Sysmeta-Ec-Etag')
+            closed_conn[etag].add(conn.closed)
+        self.assertEqual({
+            old_etag: {True},
+            new_etag: {False},
+            None: {True},
+        }, dict(closed_conn))
+
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.body, new_data[:segment_size])
         self.assertEqual(len(log), self.policy.ec_ndata + 10)
@@ -3622,8 +4793,8 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         # N.B. the object data *length* here is different
         test_data2 = (b'blah1' * segment_size)[:-333]
 
-        etag1 = md5(test_data1).hexdigest()
-        etag2 = md5(test_data2).hexdigest()
+        etag1 = md5(test_data1, usedforsecurity=False).hexdigest()
+        etag2 = md5(test_data2, usedforsecurity=False).hexdigest()
 
         ec_archive_bodies1 = self._make_ec_archive_bodies(test_data1)
         ec_archive_bodies2 = self._make_ec_archive_bodies(test_data2)
@@ -3641,28 +4812,63 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
         req = swob.Request.blank('/v1/a/c/o')
 
-        # sanity check responses1
+        orig_decode = self.policy.pyeclib_driver.decode
+        captured_fragments = []
+
+        def mock_decode(fragments):
+            captured_fragments.append(fragments)
+            return orig_decode(fragments)
+
+        # sanity check responses1 and capture frag lengths
         responses = responses1[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
                               headers=headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(md5(resp.body).hexdigest(), etag1)
+            with mock.patch.object(
+                    self.policy.pyeclib_driver, 'decode', mock_decode):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                # read body while decode is mocked
+                self.assertEqual(
+                    md5(resp.body, usedforsecurity=False).hexdigest(),
+                    etag1)
+        fragment_lengths1 = [[len(frag) for frag in frags]
+                             for frags in captured_fragments]
+        self.assertEqual(  # sanity check
+            len(ec_archive_bodies1[0]),
+            sum([length for length in [lengths[0]
+                                       for lengths in fragment_lengths1]]))
 
-        # sanity check responses2
+        # sanity check responses2 and capture frag lengths
+        captured_fragments = []
         responses = responses2[:self.policy.ec_ndata]
         status_codes, body_iter, headers = zip(*responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
                               headers=headers):
-            resp = req.get_response(self.app)
-        self.assertEqual(resp.status_int, 200)
-        self.assertEqual(md5(resp.body).hexdigest(), etag2)
+            with mock.patch.object(
+                    self.policy.pyeclib_driver, 'decode', mock_decode):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                # read body while decode is mocked
+                self.assertEqual(
+                    md5(resp.body, usedforsecurity=False).hexdigest(),
+                    etag2)
+        fragment_lengths2 = [[len(frag) for frag in frags]
+                             for frags in captured_fragments]
+        self.assertEqual(  # sanity check
+            len(ec_archive_bodies2[0]),
+            sum([length for length in [lengths[0]
+                                       for lengths in fragment_lengths2]]))
 
         # now mix the responses a bit
         mix_index = random.randint(0, self.policy.ec_ndata - 1)
         mixed_responses = responses1[:self.policy.ec_ndata]
         mixed_responses[mix_index] = responses2[mix_index]
+
+        num_segments = len(fragment_lengths1)
+        mixed_lengths = fragment_lengths1[num_segments - 1]
+        mixed_lengths[mix_index] = fragment_lengths2[
+            num_segments - 1][mix_index]
 
         status_codes, body_iter, headers = zip(*mixed_responses)
         with set_http_connect(*status_codes, body_iter=body_iter,
@@ -3680,13 +4886,18 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         msg = error_lines[0]
         self.assertIn('Error decoding fragments', msg)
         self.assertIn('/a/c/o', msg)
-        log_msg_args, log_msg_kwargs = self.logger.log_dict['error'][0]
-        self.assertEqual(log_msg_kwargs['exc_info'][0], ECDriverError)
+        self.assertIn('Segments decoded: %d' % (num_segments - 1), msg)
+        self.assertIn(
+            "[%s]" % ", ".join([str(length) for length in mixed_lengths]), msg)
+        self.assertIn("Invalid fragment payload in ECPyECLibDriver.decode",
+                      msg)
 
     def test_GET_read_timeout(self):
+        # verify EC GET behavior when initial batch of nodes time out then
+        # remaining primary nodes also time out and handoffs return 404
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-333]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
         headers = {'X-Object-Sysmeta-Ec-Etag': etag}
         self.app.recoverable_node_timeout = 0.01
@@ -3700,7 +4911,96 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         status_codes, body_iter, headers = zip(*responses + [
             (404, [b''], {}) for i in range(
                 self.policy.object_ring.max_more_nodes)])
-        with set_http_connect(*status_codes, body_iter=body_iter,
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            # do this inside the fake http context manager, it'll try to
+            # resume but won't be able to give us all the right bytes
+            self.assertNotEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag)
+        error_lines = self.logger.get_lines_for_level('error')
+        nparity = self.policy.ec_nparity
+        self.assertGreater(len(error_lines), nparity)
+        for line in error_lines[:nparity]:
+            self.assertIn('retrying', line)
+        for line in error_lines[nparity:]:
+            self.assertIn('ChunkReadTimeout (0.01s)', line)
+        for line in self.logger.logger.records['ERROR']:
+            self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_write_timeout(self):
+        # verify EC GET behavior when there's a timeout sending decoded frags
+        # via the queue.
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {'X-Object-Sysmeta-Ec-Etag': etag,
+                   'X-Object-Sysmeta-Ec-Content-Length': '333'}
+        ndata = self.policy.ec_ndata
+        responses = [
+            (200, body, self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies[:ndata])
+        ] * self.policy.ec_duplication_factor
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        status_codes, body_iter, headers = zip(*responses)
+        self.app.client_timeout = 0.01
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            resp_body = next(resp.app_iter)
+            sleep(0.5)  # lazy client
+            # remaining resp truncated
+            resp_body += b''.join(resp.app_iter)
+        # we log errors
+        log_lines = self.app.logger.get_lines_for_level('error')
+        for line in log_lines:
+            self.assertIn('ChunkWriteTimeout fetching fragments', line)
+        # client gets a short read
+        self.assertEqual(16051, len(test_data))
+        self.assertEqual(8192, len(resp_body))
+        self.assertNotEqual(
+            md5(resp_body, usedforsecurity=False).hexdigest(),
+            etag)
+
+    def test_GET_read_timeout_retrying_but_no_more_useful_nodes(self):
+        # verify EC GET behavior when initial batch of nodes time out then
+        # remaining nodes either return 404 or return data for different etag
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {'X-Object-Sysmeta-Ec-Etag': etag}
+        self.app.recoverable_node_timeout = 0.01
+        ndata = self.policy.ec_ndata
+        # only ndata responses, all of which have SlowBody
+        responses = [
+            (200, SlowBody(body, 0.1), self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies[:ndata])
+        ] * self.policy.ec_duplication_factor
+        # 2 primaries return 404
+        responses += [
+            (404, '', {}), (404, '', {})
+        ] * self.policy.ec_duplication_factor
+        # 2 primaries return different etag
+        headers2 = {'X-Object-Sysmeta-Ec-Etag': 'other_etag'}
+        responses += [
+            (200, body, self._add_frag_index(i, headers2))
+            for i, body in enumerate(ec_archive_bodies[ndata + 2:])
+        ] * self.policy.ec_duplication_factor
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        # all other (handoff) responses are 404
+        status_codes, body_iter, headers = zip(*responses + [
+            (404, [b''], {}) for i in range(
+                self.policy.object_ring.max_more_nodes)])
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
                               headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
@@ -3708,19 +5008,37 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
             # resume but won't be able to give us all the right bytes
             self.assertNotEqual(md5(resp.body).hexdigest(), etag)
         error_lines = self.logger.get_lines_for_level('error')
-        self.assertEqual(self.replicas(), len(error_lines))
-        nparity = self.policy.ec_nparity
-        for line in error_lines[:nparity]:
-            self.assertIn('retrying', line)
-        for line in error_lines[nparity:]:
+        self.assertEqual(ndata, len(error_lines))
+        for line in error_lines:
             self.assertIn('ChunkReadTimeout (0.01s)', line)
+        for line in self.logger.logger.records['ERROR']:
+            self.assertIn(req.headers['x-trans-id'], line)
+
+        debug_lines = self.logger.get_lines_for_level('debug')
+        nparity = self.policy.ec_nparity
+        nhandoffs = self.policy.object_ring.max_more_nodes
+        ignore_404 = ignore_404_handoff = 0
+        for line in debug_lines:
+            if 'Ignoring 404 from primary' in line:
+                ignore_404 += 1
+            if 'Ignoring 404 from handoff' in line:
+                ignore_404_handoff += 1
+        self.assertEqual(nparity - 2, ignore_404, debug_lines)
+        self.assertEqual(nhandoffs, ignore_404_handoff, debug_lines)
+        self.assertEqual(len(debug_lines), ignore_404_handoff + ignore_404)
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
+            'Skipping source (etag mismatch: got other_etag, '
+            'expected %s)' % etag] * 2)
 
     def test_GET_read_timeout_resume(self):
         segment_size = self.policy.ec_segment_size
         test_data = (b'test' * segment_size)[:-333]
-        etag = md5(test_data).hexdigest()
+        etag = md5(test_data, usedforsecurity=False).hexdigest()
         ec_archive_bodies = self._make_ec_archive_bodies(test_data)
-        headers = {'X-Object-Sysmeta-Ec-Etag': etag}
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+        }
         self.app.recoverable_node_timeout = 0.05
         # first one is slow
         responses = [(200, SlowBody(ec_archive_bodies[0], 0.1),
@@ -3737,10 +5055,240 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
                               headers=headers):
             resp = req.get_response(self.app)
             self.assertEqual(resp.status_int, 200)
-            self.assertTrue(md5(resp.body).hexdigest(), etag)
+            self.assertEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag)
         error_lines = self.logger.get_lines_for_level('error')
         self.assertEqual(1, len(error_lines))
         self.assertIn('retrying', error_lines[0])
+        for line in self.logger.logger.records['ERROR']:
+            self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_read_timeout_fails(self):
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+        }
+        self.app.recoverable_node_timeout = 0.05
+        # first one is slow
+        responses = [(200, SlowBody(ec_archive_bodies[0], 0.1),
+                      self._add_frag_index(0, headers))]
+        # ... the rest are fine
+        responses += [(200, body, self._add_frag_index(i, headers))
+                      for i, body in enumerate(ec_archive_bodies[1:], start=1)]
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        status_codes, body_iter, headers = zip(
+            *responses[:self.policy.ec_ndata])
+        # I don't know why fast_forward would blow up, but if it does we
+        # re-raise the ChunkReadTimeout and still want a txn-id
+        with set_http_connect(*status_codes, body_iter=body_iter,
+                              headers=headers), \
+                mock.patch(
+                    'swift.proxy.controllers.obj.ECFragGetter.fast_forward',
+                    side_effect=ValueError()):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines))
+        self.assertIn('Unable to fast forward', error_lines[0])
+        self.assertIn('Timeout fetching', error_lines[1])
+        warning_lines = self.logger.get_lines_for_level('warning')
+        self.assertEqual(1, len(warning_lines))
+        self.assertIn(
+            'Un-recoverable fragment rebuild. Only received 9/10 fragments',
+            warning_lines[0])
+        for line in self.logger.logger.records['ERROR'] + \
+                self.logger.logger.records['WARNING']:
+            self.assertIn(req.headers['x-trans-id'], line)
+
+    def test_GET_one_short_fragment_archive(self):
+        # verify that a warning is logged when one fragment archive returns
+        # less whole fragments than others
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+
+        def do_test(missing_length):
+            self.logger.clear()
+            headers = {
+                'X-Object-Sysmeta-Ec-Etag': etag,
+                'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+            }
+            responses = [(200, ec_archive_bodies[0][:(-1 * missing_length)],
+                          self._add_frag_index(0, headers))]
+            # ... the rest are fine
+            responses += [
+                (200, body, self._add_frag_index(i, headers))
+                for i, body in enumerate(ec_archive_bodies[1:], start=1)]
+
+            req = swob.Request.blank('/v1/a/c/o')
+
+            status_codes, body_iter, headers = zip(
+                *responses[:self.policy.ec_ndata])
+            with set_http_connect(*status_codes, body_iter=body_iter,
+                                  headers=headers):
+                resp = req.get_response(self.app)
+                self.assertEqual(resp.status_int, 200)
+                self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+            error_lines = self.logger.get_lines_for_level('error')
+            self.assertEqual([], error_lines)
+            warning_lines = self.logger.get_lines_for_level('warning')
+            self.assertEqual(1, len(warning_lines))
+            self.assertIn(
+                'Un-recoverable fragment rebuild. '
+                'Only received 9/10 fragments', warning_lines[0])
+
+        # each fragment archive has 4 fragments of sizes [490, 490, 490, 458];
+        # try dropping whole fragment(s) from one archive
+        do_test(458)
+        do_test(490 + 458)
+        do_test(490 + 490 + 458)
+        do_test(490 + 490 + 490 + 458)
+
+    def test_GET_trigger_ec_metadata_check_failure(self):
+        # verify that a warning is logged when there are only k - 1 fragment
+        segment_size = self.policy.ec_segment_size
+        test_data = (b'test' * segment_size)[:-333]
+        etag = md5(test_data).hexdigest()
+        ec_archive_bodies = self._make_ec_archive_bodies(test_data)
+        bad_bodies = [b'd' * segment_size] * (self.policy.ec_nparity + 1)
+        ec_archive_bodies = \
+            ec_archive_bodies[:self.policy.ec_ndata - 1] + bad_bodies
+
+        self.logger.clear()
+        headers = {
+            'X-Object-Sysmeta-Ec-Etag': etag,
+            'X-Object-Sysmeta-Ec-Content-Length': len(test_data),
+        }
+        responses = [
+            (200, body, self._add_frag_index(i, headers))
+            for i, body in enumerate(ec_archive_bodies)]
+
+        req = swob.Request.blank('/v1/a/c/o')
+
+        status_codes, body_iter, headers = zip(
+            *responses[:self.policy.ec_ndata])
+        with set_http_connect(*status_codes, body_iter=body_iter,
+                              headers=headers):
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 500)
+            self.assertNotEqual(md5(resp.body).hexdigest(), etag)
+        error_lines = self.logger.get_lines_for_level('error')
+        expected_log_line = (
+            "Error decoding fragments for '/a/c/o'. "
+            "Segments decoded: 0, Lengths: "
+            "[490, 490, 490, 490, 490, 490, 490, 490, 490, 490]: "
+            "pyeclib_c_decode ERROR: Fragment integrity check failed. "
+            "Please inspect syslog for liberasurecode error report.")
+        self.assertEqual(expected_log_line, error_lines[0])
+
+    def test_GET_read_timeout_resume_mixed_etag(self):
+        segment_size = self.policy.ec_segment_size
+        test_data2 = (b'blah1' * segment_size)[:-333]
+        test_data1 = (b'test' * segment_size)[:-333]
+        etag2 = md5(test_data2, usedforsecurity=False).hexdigest()
+        etag1 = md5(test_data1, usedforsecurity=False).hexdigest()
+        ec_archive_bodies2 = self._make_ec_archive_bodies(test_data2)
+        ec_archive_bodies1 = self._make_ec_archive_bodies(test_data1)
+        headers2 = {'X-Object-Sysmeta-Ec-Etag': etag2,
+                    'X-Object-Sysmeta-Ec-Content-Length': len(test_data2),
+                    'X-Backend-Timestamp': self.ts().internal}
+        headers1 = {'X-Object-Sysmeta-Ec-Etag': etag1,
+                    'X-Object-Sysmeta-Ec-Content-Length': len(test_data1),
+                    'X-Backend-Timestamp': self.ts().internal}
+        responses = [
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[1], self._add_frag_index(1, headers1)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, SlowBody(ec_archive_bodies1[3], 0.1), self._add_frag_index(
+                3, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[4], self._add_frag_index(4, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[5], self._add_frag_index(5, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[6], self._add_frag_index(6, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[7], self._add_frag_index(7, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[8], self._add_frag_index(8, headers2)),
+            # etag1
+            (200, SlowBody(ec_archive_bodies1[9], 0.1), self._add_frag_index(
+                9, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[10], self._add_frag_index(10, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[11], self._add_frag_index(11, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[12], self._add_frag_index(12, headers2)),
+            # 404
+            (404, [b''], {}),
+            # handoffs start here
+            # etag2
+            (200, ec_archive_bodies2[0], self._add_frag_index(0, headers2)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[2], self._add_frag_index(2, headers1)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[4], self._add_frag_index(4, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[1], self._add_frag_index(1, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[6], self._add_frag_index(6, headers1)),
+            # etag2
+            (200, ec_archive_bodies2[7], self._add_frag_index(7, headers2)),
+            # etag1
+            (200, ec_archive_bodies1[8], self._add_frag_index(8, headers1)),
+            # resume requests start here
+            # 404
+            (404, [b''], {}),
+            # etag2
+            (200, ec_archive_bodies2[3], self._add_frag_index(3, headers2)),
+            # 404
+            (404, [b''], {}),
+            # etag1
+            (200, ec_archive_bodies1[10], self._add_frag_index(10, headers1)),
+            # etag1
+            (200, ec_archive_bodies1[12], self._add_frag_index(12, headers1)),
+        ]
+        self.app.recoverable_node_timeout = 0.01
+        req = swob.Request.blank('/v1/a/c/o')
+        status_codes, body_iter, headers = zip(*responses)
+        with mocked_http_conn(*status_codes, body_iter=body_iter,
+                              headers=headers) as log:
+            resp = req.get_response(self.app)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(
+                md5(resp.body, usedforsecurity=False).hexdigest(),
+                etag1)
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual(2, len(error_lines))
+        for line in error_lines:
+            self.assertIn('retrying', line)
+        for line in self.logger.logger.records['ERROR']:
+            self.assertIn(req.headers['x-trans-id'], line)
+        etag2_conns = []
+        for conn in log.responses:
+            if conn.headers.get('X-Object-Sysmeta-Ec-Etag') == etag2:
+                etag2_conns.append(conn)
+        self.assertEqual(
+            ([True] * 8) + [False],  # the resumed etag2 doesn't get closed
+            [conn.closed for conn in etag2_conns])
 
     def test_fix_response_HEAD(self):
         headers = {'X-Object-Sysmeta-Ec-Content-Length': '10',
@@ -3784,7 +5332,7 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
 
     def _test_invalid_ranges(self, method, real_body, segment_size, req_range):
         # make a request with range starts from more than real size.
-        body_etag = md5(real_body).hexdigest()
+        body_etag = md5(real_body, usedforsecurity=False).hexdigest()
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method=method,
             headers={'Destination': 'c1/o',
@@ -3824,6 +5372,43 @@ class TestECObjController(ECObjectControllerMixin, unittest.TestCase):
         self.assertEqual(resp.body, range_not_satisfiable_body)
         self.assertEqual(resp.etag, body_etag)
         self.assertEqual(resp.headers['Accept-Ranges'], 'bytes')
+
+    def test_non_durable_ec_response_bucket(self):
+        ts = self.ts()
+        bucket = obj.ECGetResponseBucket(self.policy, ts)
+        self.assertEqual(bucket.shortfall, self.policy.ec_ndata)
+        for i in range(1, self.policy.ec_ndata - self.policy.ec_nparity + 1):
+            stub_getter = mock.MagicMock(last_status=200, last_headers={
+                'X-Backend-Timestamp': ts.internal,
+                'X-Object-Sysmeta-Ec-Etag': 'the-etag',
+                'X-Object-Sysmeta-Ec-Frag-Index': str(i),
+            })
+            bucket.add_response(stub_getter, None)
+            self.assertEqual(bucket.shortfall, self.policy.ec_ndata - i)
+        self.assertEqual(bucket.shortfall, self.policy.ec_nparity)
+        self.assertFalse(bucket.durable)
+        expectations = (
+            4,  # 7
+            4,  # 8
+            4,  # 9
+            4,  # 10
+            3,  # 11
+            2,  # 12
+            1,  # 13
+            1,  # 14
+        )
+        for i, expected in zip(range(
+                self.policy.ec_ndata - self.policy.ec_nparity + 1,
+                self.policy.object_ring.replica_count + 1), expectations):
+            stub_getter = mock.MagicMock(last_status=200, last_headers={
+                'X-Backend-Timestamp': ts.internal,
+                'X-Object-Sysmeta-Ec-Etag': 'the-etag',
+                'X-Object-Sysmeta-Ec-Frag-Index': str(i),
+            })
+            bucket.add_response(stub_getter, None)
+            msg = 'With %r resp, expected shortfall %s != %s' % (
+                bucket.gets.keys(), expected, bucket.shortfall)
+            self.assertEqual(bucket.shortfall, expected, msg)
 
 
 class TestECFunctions(unittest.TestCase):
@@ -3951,7 +5536,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -3969,7 +5556,8 @@ class TestECDuplicationObjController(
         # the backend requests will stop at enough ec_ndata responses
         self.assertEqual(
             len(frags), self.policy.ec_ndata,
-            'collected %s frags for etag %s' % (len(frags), etag))
+            'collected %s frags (expected %s) for etag %s' % (
+                len(frags), self.policy.ec_ndata, etag))
 
     # TODO: actually "frags" in node_frags is meaning "node_index" right now
     # in following tests. Reconsidering the name and semantics change needed.
@@ -4126,7 +5714,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -4198,7 +5788,9 @@ class TestECDuplicationObjController(
 
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(resp.headers['etag'], obj2['etag'])
-        self.assertEqual(md5(resp.body).hexdigest(), obj2['etag'])
+        self.assertEqual(
+            md5(resp.body, usedforsecurity=False).hexdigest(),
+            obj2['etag'])
 
         collected_responses = defaultdict(set)
         for conn in log:
@@ -4721,7 +6313,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
         env = {'swift.callback.update_footers': footers_callback}
         req = swift.common.swob.Request.blank(
             '/v1/a/c/o', method='PUT', environ=env)
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         size = len(test_body)
         req.body = test_body
         if chunked:
@@ -4822,7 +6414,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                 'X-Object-Sysmeta-Ec-Etag': etag,
                 'X-Backend-Container-Update-Override-Etag': etag,
                 'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                'Etag': md5(obj_payload).hexdigest()})
+                'Etag': md5(obj_payload, usedforsecurity=False).hexdigest()})
             for header, value in expected.items():
                 self.assertEqual(footer_metadata[header], value)
 
@@ -4854,7 +6446,7 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
         # trailing metadata
         segment_size = self.policy.ec_segment_size
         test_body = (b'asdf' * segment_size)[:-10]
-        etag = md5(test_body).hexdigest()
+        etag = md5(test_body, usedforsecurity=False).hexdigest()
         size = len(test_body)
         codes = [201] * self.replicas()
         resp_headers = {
@@ -4930,7 +6522,9 @@ class TestECObjControllerMimePutter(BaseObjectControllerMixin,
                     'X-Object-Sysmeta-Ec-Content-Length': str(size),
                     'X-Object-Sysmeta-Ec-Etag': etag,
                     'X-Object-Sysmeta-Ec-Segment-Size': str(segment_size),
-                    'Etag': md5(obj_part.get_payload(decode=True)).hexdigest()}
+                    'Etag': md5(
+                        obj_part.get_payload(decode=True),
+                        usedforsecurity=False).hexdigest()}
                 expected.update(expect_added)
                 for header, value in expected.items():
                     self.assertIn(header, footer_metadata)

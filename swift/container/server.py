@@ -17,8 +17,6 @@ import json
 import os
 import time
 import traceback
-import math
-from swift import gettext_ as _
 
 from eventlet import Timeout
 
@@ -32,9 +30,9 @@ from swift.container.backend import ContainerBroker, DATADIR, \
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.container_sync_realms import ContainerSyncRealms
-from swift.common.request_helpers import get_param, \
-    split_and_validate_path, is_sys_or_user_meta, \
-    validate_internal_container, validate_internal_obj, constrain_req_limit
+from swift.common.request_helpers import split_and_validate_path, \
+    is_sys_or_user_meta, validate_internal_container, validate_internal_obj, \
+    validate_container_params
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
@@ -43,7 +41,6 @@ from swift.common.utils import get_logger, hash_path, public, \
     ShardRange
 from swift.common.constraints import valid_timestamp, check_utf8, \
     check_drive, AUTO_CREATE_ACCOUNT_PREFIX
-from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.http import HTTP_NO_CONTENT, HTTP_NOT_FOUND, is_success
@@ -239,10 +236,10 @@ class ContainerController(BaseStorageServer):
         if len(account_hosts) != len(account_devices):
             # This shouldn't happen unless there's a bug in the proxy,
             # but if there is, we want to know about it.
-            self.logger.error(_(
+            self.logger.error(
                 'ERROR Account update failed: different  '
                 'numbers of hosts and devices in request: '
-                '"%(hosts)s" vs "%(devices)s"') % {
+                '"%(hosts)s" vs "%(devices)s"', {
                     'hosts': req.headers.get('X-Account-Host', ''),
                     'devices': req.headers.get('X-Account-Device', '')})
             return HTTPBadRequest(req=req)
@@ -285,18 +282,18 @@ class ContainerController(BaseStorageServer):
                     if account_response.status == HTTP_NOT_FOUND:
                         account_404s += 1
                     elif not is_success(account_response.status):
-                        self.logger.error(_(
+                        self.logger.error(
                             'ERROR Account update failed '
                             'with %(ip)s:%(port)s/%(device)s (will retry '
-                            'later): Response %(status)s %(reason)s'),
+                            'later): Response %(status)s %(reason)s',
                             {'ip': account_ip, 'port': account_port,
                              'device': account_device,
                              'status': account_response.status,
                              'reason': account_response.reason})
             except (Exception, Timeout):
-                self.logger.exception(_(
+                self.logger.exception(
                     'ERROR account update failed with '
-                    '%(ip)s:%(port)s/%(device)s (will retry later)'),
+                    '%(ip)s:%(port)s/%(device)s (will retry later)',
                     {'ip': account_ip, 'port': account_port,
                      'device': account_device})
         if updates and account_404s == len(updates):
@@ -600,7 +597,7 @@ class ContainerController(BaseStorageServer):
                                 is_sys_or_user_meta('container', key)))
         headers['Content-Type'] = out_content_type
         resp = HTTPNoContent(request=req, headers=headers, charset='utf-8')
-        resp.last_modified = math.ceil(float(headers['X-PUT-Timestamp']))
+        resp.last_modified = Timestamp(headers['X-PUT-Timestamp']).ceil()
         return resp
 
     def update_data_record(self, record):
@@ -646,6 +643,19 @@ class ContainerController(BaseStorageServer):
           has value ``auto``, and the container state is ``sharding`` or
           ``sharded``, then the listing will be a list of shard ranges;
           otherwise the response body will be a list of objects.
+
+        * Both shard range and object listings may be filtered according to
+          the constraints described below. However, the
+          ``X-Backend-Ignore-Shard-Name-Filter`` header may be used to override
+          the application of the ``marker``, ``end_marker``, ``includes`` and
+          ``reverse`` parameters to shard range listings. These parameters will
+          be ignored if the header has the value 'sharded' and the current db
+          sharding state is also 'sharded'. Note that this header does not
+          override the ``states`` constraint on shard range listings.
+
+        * The order of both shard range and object listings may be reversed by
+          using a ``reverse`` query string parameter with a
+          value in :attr:`swift.common.utils.TRUE_VALUES`.
 
         * Both shard range and object listings may be constrained to a name
           range by the ``marker`` and ``end_marker`` query string parameters.
@@ -698,13 +708,14 @@ class ContainerController(BaseStorageServer):
         :returns: an instance of :class:`swift.common.swob.Response`
         """
         drive, part, account, container, obj = get_obj_name_and_placement(req)
-        path = get_param(req, 'path')
-        prefix = get_param(req, 'prefix')
-        delimiter = get_param(req, 'delimiter')
-        marker = get_param(req, 'marker', '')
-        end_marker = get_param(req, 'end_marker')
-        limit = constrain_req_limit(req, constraints.CONTAINER_LISTING_LIMIT)
-        reverse = config_true_value(get_param(req, 'reverse'))
+        params = validate_container_params(req)
+        path = params.get('path')
+        prefix = params.get('prefix')
+        delimiter = params.get('delimiter')
+        marker = params.get('marker', '')
+        end_marker = params.get('end_marker')
+        limit = params['limit']
+        reverse = config_true_value(params.get('reverse'))
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
             check_drive(self.root, drive, self.mount_check)
@@ -715,8 +726,8 @@ class ContainerController(BaseStorageServer):
                                             stale_reads_ok=True)
         info, is_deleted = broker.get_info_is_deleted()
         record_type = req.headers.get('x-backend-record-type', '').lower()
-        if record_type == 'auto' and info.get('db_state') in (SHARDING,
-                                                              SHARDED):
+        db_state = info.get('db_state')
+        if record_type == 'auto' and db_state in (SHARDING, SHARDED):
             record_type = 'shard'
         if record_type == 'shard':
             override_deleted = info and config_true_value(
@@ -726,12 +737,24 @@ class ContainerController(BaseStorageServer):
             if is_deleted and not override_deleted:
                 return HTTPNotFound(request=req, headers=resp_headers)
             resp_headers['X-Backend-Record-Type'] = 'shard'
-            includes = get_param(req, 'includes')
-            states = get_param(req, 'states')
-            fill_gaps = False
+            includes = params.get('includes')
+            override_filter_hdr = req.headers.get(
+                'x-backend-override-shard-name-filter', '').lower()
+            if override_filter_hdr == db_state == 'sharded':
+                # respect the request to send back *all* ranges if the db is in
+                # sharded state
+                resp_headers['X-Backend-Override-Shard-Name-Filter'] = 'true'
+                marker = end_marker = includes = None
+                reverse = False
+            states = params.get('states')
+            fill_gaps = include_own = False
             if states:
                 states = list_from_csv(states)
                 fill_gaps = any(('listing' in states, 'updating' in states))
+                # 'auditing' is used during shard audit; if the shard is
+                # shrinking then it needs to get acceptor shard ranges, which
+                # may be the root container itself, so use include_own
+                include_own = 'auditing' in states
                 try:
                     states = broker.resolve_shard_range_states(states)
                 except ValueError:
@@ -740,18 +763,25 @@ class ContainerController(BaseStorageServer):
                 req.headers.get('x-backend-include-deleted', False))
             container_list = broker.get_shard_ranges(
                 marker, end_marker, includes, reverse, states=states,
-                include_deleted=include_deleted, fill_gaps=fill_gaps)
+                include_deleted=include_deleted, fill_gaps=fill_gaps,
+                include_own=include_own)
         else:
+            requested_policy_index = self.get_and_validate_policy_index(req)
             resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
             if is_deleted:
                 return HTTPNotFound(request=req, headers=resp_headers)
             resp_headers['X-Backend-Record-Type'] = 'object'
+            storage_policy_index = (
+                requested_policy_index if requested_policy_index is not None
+                else info['storage_policy_index'])
+            resp_headers['X-Backend-Record-Storage-Policy-Index'] = \
+                storage_policy_index
             # Use the retired db while container is in process of sharding,
             # otherwise use current db
             src_broker = broker.get_brokers()[0]
             container_list = src_broker.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
-                storage_policy_index=info['storage_policy_index'],
+                storage_policy_index=storage_policy_index,
                 reverse=reverse, allow_reserved=req.allow_reserved_names)
         return self.create_listing(req, out_content_type, info, resp_headers,
                                    broker.metadata, container_list, container)
@@ -773,7 +803,7 @@ class ContainerController(BaseStorageServer):
 
         ret = Response(request=req, headers=resp_headers, body=body,
                        content_type=out_content_type, charset='utf-8')
-        ret.last_modified = math.ceil(float(resp_headers['X-PUT-Timestamp']))
+        ret.last_modified = Timestamp(resp_headers['X-PUT-Timestamp']).ceil()
         if not ret.body:
             ret.status_int = HTTP_NO_CONTENT
         return ret
@@ -868,8 +898,8 @@ class ContainerController(BaseStorageServer):
             except HTTPException as error_response:
                 res = error_response
             except (Exception, Timeout):
-                self.logger.exception(_(
-                    'ERROR __call__ error with %(method)s %(path)s '),
+                self.logger.exception(
+                    'ERROR __call__ error with %(method)s %(path)s ',
                     {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         if self.log_requests:
