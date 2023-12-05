@@ -347,7 +347,7 @@ monitoring solution to achieve this. The following is an example script:
 
 .. code-block:: python
 
-    #!/usr/bin/env python
+    #!/usr/bin/env python3
     import os
     import errno
 
