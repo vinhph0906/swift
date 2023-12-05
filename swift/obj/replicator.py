@@ -16,9 +16,8 @@
 from collections import defaultdict
 import os
 import errno
-from os.path import isdir, isfile, join, dirname
+from os.path import join, dirname
 import random
-import shutil
 import time
 import itertools
 from six import viewkeys
@@ -32,7 +31,7 @@ from swift.common.constraints import check_drive
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import whataremyips, unlink_older_than, \
     compute_eta, get_logger, dump_recon_cache, \
-    rsync_module_interpolation, mkdirs, config_true_value, \
+    rsync_module_interpolation, config_true_value, \
     config_auto_int_value, storage_directory, \
     load_recon_cache, PrefixLoggerAdapter, parse_override_options, \
     distribute_evenly, listdir, node_to_string
@@ -501,9 +500,10 @@ class ObjectReplicator(Daemon):
         :param job: a dict containing info about the partition to be replicated
         """
 
+        df_mgr = self._df_router[job['policy']]
+
         def tpool_get_suffixes(path):
-            return [suff for suff in listdir(path)
-                    if len(suff) == 3 and isdir(join(path, suff))]
+            return [suff for suff in df_mgr.listdir(path)
 
         stats = self.stats_for_dev[job['device']]
         stats.attempted += 1
@@ -556,40 +556,11 @@ class ObjectReplicator(Daemon):
                     successes_count = len([resp for resp in responses if resp])
                     delete_handoff = successes_count >= self.handoff_delete
                 else:
-                    # delete handoff if all syncs were successful
-                    delete_handoff = len(responses) == len(job['nodes']) and \
-                        all(responses)
-                if delete_handoff:
-                    stats.remove += 1
-                    if (self.conf.get('sync_method', 'rsync') == 'ssync' and
-                            delete_objs is not None):
-                        self.logger.info("Removing %s objects",
-                                         len(delete_objs))
-                        _junk, error_paths = self.delete_handoff_objs(
-                            job, delete_objs)
-                        # if replication works for a hand-off device and it
-                        # failed, the remote devices which are target of the
-                        # replication from the hand-off device will be marked.
-                        # Because cleanup after replication failed means
-                        # replicator needs to replicate again with the same
-                        # info.
-                        if error_paths:
-                            failure_devs_info.update(
-                                [(failure_dev['replication_ip'],
-                                  failure_dev['device'])
-                                 for failure_dev in job['nodes']])
-                    else:
-                        self.delete_partition(job['path'])
-                        handoff_partition_deleted = True
-                elif not suffixes:
-                    self.delete_partition(job['path'])
+                    self.delete_partition(df_mgr, job['path'])
                     handoff_partition_deleted = True
-        except PartitionLockTimeout:
-            self.logger.info("Unable to lock handoff partition %s for "
-                             "replication on device %s policy %d",
-                             job['partition'], job['device'],
-                             job['policy'])
-            self.logger.increment('partition.lock-failure.count')
+            elif not suffixes:
+                self.delete_partition(df_mgr, job['path'])
+                handoff_partition_deleted = True
         except (Exception, Timeout):
             self.logger.exception("Error syncing handoff partition")
         finally:
@@ -603,10 +574,10 @@ class ObjectReplicator(Daemon):
             self.partition_times.append(time.time() - begin)
             self.logger.timing_since('partition.delete.timing', begin)
 
-    def delete_partition(self, path):
-        self.logger.info("Removing partition: %s", path)
+    def delete_partition(self, df_mgr, path):
+        self.logger.info(_("Removing partition: %s"), path)
         try:
-            tpool.execute(shutil.rmtree, path)
+            tpool.execute(df_mgr.rmtree, path)
         except OSError as e:
             if e.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.ENODATA):
                 # Don't worry if there was a race to create or delete,
@@ -614,15 +585,16 @@ class ObjectReplicator(Daemon):
                 raise
 
     def delete_handoff_objs(self, job, delete_objs):
+        df_mgr = self._df_router[job['policy']]
         success_paths = []
         error_paths = []
         for object_hash in delete_objs:
             object_path = storage_directory(job['obj_path'], job['partition'],
                                             object_hash)
-            tpool.execute(shutil.rmtree, object_path, ignore_errors=True)
+            tpool.execute(df_mgr.rmtree, object_path, ignore_errors=True)
             suffix_dir = dirname(object_path)
             try:
-                os.rmdir(suffix_dir)
+                df_mgr.rmdir(suffix_dir)
                 success_paths.append(object_path)
             except OSError as e:
                 if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
@@ -835,13 +807,14 @@ class ObjectReplicator(Daemon):
             tmp_path = join(dev_path, get_tmp_dir(policy))
             unlink_older_than(tmp_path, time.time() -
                               df_mgr.reclaim_age)
-            if not os.path.exists(obj_path):
+            if not df_mgr.exists(obj_path):
                 try:
-                    mkdirs(obj_path)
+                    df_mgr.mkdirs(obj_path)
                 except Exception:
                     self.logger.exception('ERROR creating %s' % obj_path)
                 continue
-            for partition in listdir(obj_path):
+
+            for partition in df_mgr.listdir(obj_path):
                 if (override_partitions is not None and partition.isdigit()
                         and int(partition) not in override_partitions):
                     continue
@@ -955,6 +928,7 @@ class ObjectReplicator(Daemon):
                                      override_partitions=override_partitions,
                                      override_policies=override_policies)
             for job in jobs:
+                df_mgr = self._df_router[job['policy']]
                 dev_stats = self.stats_for_dev[job['device']]
                 num_jobs += 1
                 current_nodes = job['nodes']
@@ -982,13 +956,13 @@ class ObjectReplicator(Daemon):
                     return
 
                 try:
-                    if isfile(job['path']):
+                    if df_mgr.isfile(job['path']):
                         # Clean up any (probably zero-byte) files where a
                         # partition should be.
                         self.logger.warning(
                             'Removing partition directory '
                             'which was a file: %s', job['path'])
-                        os.remove(job['path'])
+                        df_mgr.remove(job['path'])
                         continue
                 except OSError:
                     continue

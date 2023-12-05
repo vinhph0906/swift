@@ -17,6 +17,12 @@
   roles:
     - ensure-pip
   tasks:
+    - name: installing dependencies
+      package: name={{ item }} state=present
+      with_items:
+        - python-pyeclib
+        - python-nose
+        - python-swiftclient
     - name: upgrade pip, but not too far
       pip:
         # 20.* works on both py2 and py3, and the pip for centos7 in EPEL

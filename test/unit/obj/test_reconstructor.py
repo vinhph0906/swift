@@ -1056,7 +1056,7 @@ class TestGlobalSetupObjectReconstructor(unittest.TestCase):
             raise OSError('Ow!')
 
         self.reconstructor._reset_stats()
-        with mock.patch.object(object_reconstructor, 'mkdirs', blowup_mkdirs):
+        with mock.patch.object(diskfile, 'mkdirs', blowup_mkdirs):
             rmtree(self.objects_1, ignore_errors=1)
             parts = []
             for part_info in self.reconstructor.collect_parts():
@@ -3552,7 +3552,7 @@ class TestObjectReconstructor(BaseTestObjectReconstructor):
         utils.mkdirs(os.path.dirname(datadir_path))
         with mock.patch('swift.obj.reconstructor.whataremyips',
                         return_value=[self.ip]), \
-                mock.patch('swift.obj.reconstructor.mkdirs',
+                mock.patch('swift.obj.diskfile.mkdirs',
                            side_effect=OSError('kaboom!')):
             self.assertEqual([], list(self.reconstructor.collect_parts()))
         error_lines = self.logger.get_lines_for_level('error')
