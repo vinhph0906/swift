@@ -503,7 +503,7 @@ class ObjectReplicator(Daemon):
         df_mgr = self._df_router[job['policy']]
 
         def tpool_get_suffixes(path):
-            return [suff for suff in df_mgr.listdir(path)
+            return [suff for suff in df_mgr.listdir(path)]
 
         stats = self.stats_for_dev[job['device']]
         stats.attempted += 1
@@ -558,7 +558,7 @@ class ObjectReplicator(Daemon):
                 else:
                     self.delete_partition(df_mgr, job['path'])
                     handoff_partition_deleted = True
-            elif not suffixes:
+            if not suffixes:
                 self.delete_partition(df_mgr, job['path'])
                 handoff_partition_deleted = True
         except (Exception, Timeout):

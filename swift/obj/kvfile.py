@@ -48,7 +48,7 @@ from swift.obj.diskfile import BaseDiskFileManager, DiskFileManager, \
     ECDiskFileManager, BaseDiskFile, DiskFile, DiskFileReader, DiskFileWriter,\
     BaseDiskFileReader, BaseDiskFileWriter, ECDiskFile, ECDiskFileReader, \
     ECDiskFileWriter, AuditLocation, RESERVED_DATAFILE_META, \
-    DATAFILE_SYSTEM_META, strip_self, DEFAULT_RECLAIM_AGE, _encode_metadata, \
+    DATAFILE_SYSTEM_META, DEFAULT_RECLAIM_AGE, _encode_metadata, \
     get_part_path, get_data_dir, update_auditor_status, extract_policy, \
     HASH_FILE, read_hashes, write_hashes, consolidate_hashes, invalidate_hash
 
@@ -679,9 +679,9 @@ class KVFile(BaseKVFile, DiskFile):
 class BaseKVFileManager(BaseDiskFileManager):
     diskfile_cls = None  # must be set by subclasses
 
-    invalidate_hash = strip_self(invalidate_hash)
-    consolidate_hashes = strip_self(consolidate_hashes)
-    quarantine_renamer = strip_self(quarantine_vrenamer)
+    invalidate_hash = staticmethod(invalidate_hash)
+    consolidate_hashes = staticmethod(consolidate_hashes)
+    quarantine_renamer = staticmethod(quarantine_vrenamer)
 
     def __init__(self, conf, logger):
         self.logger = logger
