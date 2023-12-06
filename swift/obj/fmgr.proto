@@ -4,6 +4,7 @@ package filemgr;
 
 // Python: protoc -I. --python_out=. fmgr.proto
 // Golang : protoc -I proto proto/fmgr.proto --go_out=proto
+option go_package = "filemgr";
 
 message RegisterVolumeRequest {
     uint32 partition = 1;  // Swift partition
