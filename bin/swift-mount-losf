@@ -59,7 +59,7 @@ def dummy_getattr(path):
     st_mode = S_IFDIR | S_IRUSR
     st_size = 4096
 
-    stats = {"st_mode": st_mode, "st_ino": 6434658, "st_dev": 64515L,
+    stats = {"st_mode": st_mode, "st_ino": 6434658, "st_dev": 64515,
              "st_nlink": 2, "st_uid": 3014, "st_gid": 3014,
              "st_size": st_size, "st_atime": 1494423623,
              "st_mtime": 1494423609, "st_ctime": 1494423609}
@@ -78,7 +78,7 @@ def vfile_getattr(path):
         st_mode = S_IFLNK | S_IRUSR
         st_size = 0
 
-    stats = {"st_mode": st_mode, "st_ino": 6434658, "st_dev": 64515L,
+    stats = {"st_mode": st_mode, "st_ino": 6434658, "st_dev": 64515,
              "st_nlink": 2, "st_uid": 3014, "st_gid": 3014,
              "st_size": st_size, "st_atime": 1494423623,
              "st_mtime": 1494423609, "st_ctime": 1494423609}
