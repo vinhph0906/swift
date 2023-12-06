@@ -644,7 +644,10 @@ class BaseKVFileWriter(BaseDiskFileWriter):
 
         return self._upload_size
 
-    def _finalize_put(self, metadata, target_path, cleanup):
+    def _finalize_put(self, metadata, target_path, cleanup,
+                      logger_thread_locals):
+        if logger_thread_locals is not None:
+            self.logger.thread_locals = logger_thread_locals
         filename = basename(target_path)
         # write metadata and sync
         self._vfile_writer.commit(filename, _encode_metadata(metadata))

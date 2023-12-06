@@ -16,10 +16,11 @@
 package main
 
 import (
+	"log/syslog"
+	"os"
+
 	"github.com/sirupsen/logrus"
 	lSyslog "github.com/sirupsen/logrus/hooks/syslog"
-	"io/ioutil"
-	"log/syslog"
 )
 
 // global logger
@@ -37,7 +38,7 @@ func setupLogging() {
 	}
 
 	log.Hooks.Add(hook)
-
+	log.SetOutput(os.Stdout)
 	// Disable default logging, we only want to log through the syslog hook
-	log.Out = ioutil.Discard
+	// log.Out = ioutil.Discard
 }

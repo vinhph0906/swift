@@ -49,7 +49,7 @@ from swift.common import manager
 def op(func):
     def fwrap(*args, **kwargs):
         logging.debug(
-            "func: {} args: kwargs: {}".format(func.func_name, args, kwargs))
+            "func: {} args: kwargs: {}".format(func.__name__, args, kwargs))
         return func(*args, **kwargs)
 
     return fwrap

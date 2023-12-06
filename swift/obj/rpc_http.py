@@ -64,7 +64,7 @@ def get_rpc_reply(conn, pb_type):
     :return: protobuf object, or raise an exception if HTTP status is not 200
     """
     # if buffering is not set, httplib will call recvfrom() for every char
-    http_response = conn.getresponse(buffering=True)
+    http_response = conn.getresponse()
     if http_response.status != StatusCode.Ok:
         raise RpcError(http_response.read(), http_response.status)
 
