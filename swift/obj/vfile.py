@@ -1139,11 +1139,11 @@ def read_metadata(fp, offset, header):
     metadata = {}
     for attr in meta.attrs:
         if attr.key:
-            if six.PY2:
-                metadata[attr.key] = attr.value
-            else:
-                metadata[attr.key.decode('utf8', 'surrogateescape')] = \
-                    attr.value.decode('utf8', 'surrogateescape')
+            # if six.PY2:
+            metadata[attr.key] = attr.value
+            # else:
+            #     metadata[attr.key] = \
+            #         attr.value
 
     return metadata
 
